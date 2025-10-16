@@ -1,0 +1,1 @@
+tcc.exe -o singbox_tray.exe singbox_tray_with_converter.c -mwindows -lwininet -lcomctl32 -ladvapi32 -lshell32 >log.txt 2>&1

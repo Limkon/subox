@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>节点配置转换器</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        .container {
+            background-color: #fff;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            max-width: 900px;
+            margin: auto;
+        }
+        h1 {
+            color: #0056b3;
+            text-align: center;
+            margin-bottom: 25px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+        textarea {
+            width: calc(100% - 20px);
+            padding: 10px;
+            margin-bottom: 15px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px;
+            min-height: 150px;
+            box-sizing: border-box;
+        }
+        .button-group {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            flex-grow: 1;
+            max-width: 150px;
+            transition: background-color 0.3s ease;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        pre {
+            background-color: #eee;
+            padding: 15px;
+            border-radius: 5px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px dashed #ccc;
+        }
+        .error {
+            color: red;
+            margin-top: 10px;
+            text-align: center;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>节点配置转换器</h1>
+
+        <label for="nodeInput">请输入节点信息 (每行一个):</label>
+        <textarea id="nodeInput"></textarea>
+
+        <div class="button-group">
+            <button onclick="convertNodes()">转换</button>
+            <button id="saveButton" onclick="saveConfig()" disabled>保存为 config.json</button>
+        </div>
+
+        <label for="outputConfig">生成的配置文件:</label>
+        <textarea id="outputConfig" readonly></textarea>
+
+        <p class="error" id="errorMessage"></p>
+    </div>
+
+    <script>
+        // 完全本地化的 Base64 解码函数，支持 UTF-8
+        function base64Decode(str) {
+            try {
+                str = str.replace(/-/g, '+').replace(/_/g, '/');
+                while (str.length % 4) {
+                    str += '=';
+                }
+                const binary_string = atob(str);
+                const len = binary_string.length;
+                const bytes = new Uint8Array(new ArrayBuffer(len));
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binary_string.charCodeAt(i);
+                }
+                const decoder = new TextDecoder('utf-8');
+                return decoder.decode(bytes);
+            } catch (e) {
+                console.error("Base64 decoding error:", e);
+                return null;
+            }
+        }
+
+        function parseUrl(url) {
+            try {
+                const protocol = url.split('://')[0].toLowerCase();
+
+                // VMESS
+                if (protocol === 'vmess') {
+                    const base64Str = url.replace('vmess://', '').trim();
+                    const decoded = base64Decode(base64Str);
+                    if (!decoded) {
+                        throw new Error("VMess base64 decoding failed.");
+                    }
+                    const vmessObj = JSON.parse(decoded);
+                    return {
+                        type: protocol,
+                        server: vmessObj.add,
+                        port: vmessObj.port,
+                        uuid: vmessObj.id,
+                        net: vmessObj.net,
+                        path: vmessObj.path,
+                        tls: vmessObj.tls,
+                        host: vmessObj.host,
+                        ps: vmessObj.ps,
+                        sni: vmessObj.sni,
+                        scy: vmessObj.scy
+                    };
+                }
+
+                // HYSTERIA2
+                if (protocol === 'hysteria2') {
+                    const u = new URL(url);
+                    return {
+                        type: 'hysteria2',
+                        server: u.hostname,
+                        port: parseInt(u.port || '443', 10),
+                        password: u.username,
+                        tag: decodeURIComponent(u.hash.replace('#', '')) || u.hostname,
+                        insecure: u.searchParams.get('insecure') === '1',
+                        params: Object.fromEntries(u.searchParams.entries()) // For any additional params
+                    };
+                }
+
+                // VLESS / TROJAN
+                if (protocol === 'vless' || protocol === 'trojan') {
+                    const urlWithoutProtocol = url.substring(url.indexOf('://') + 3);
+                    const hashIndex = urlWithoutProtocol.indexOf('#');
+                    const coreAndParams = hashIndex !== -1 ? urlWithoutProtocol.substring(0, hashIndex) : urlWithoutProtocol;
+                    const hashPart = hashIndex !== -1 ? decodeURIComponent(urlWithoutProtocol.substring(hashIndex + 1)) : '';
+
+                    let userInfo = '';
+                    let hostPortPathQueryString = coreAndParams;
+
+                    const atIndex = coreAndParams.indexOf('@');
+                    if (atIndex !== -1) {
+                        userInfo = coreAndParams.substring(0, atIndex);
+                        hostPortPathQueryString = coreAndParams.substring(atIndex + 1);
+                    }
+
+                    let host = '';
+                    let port = '';
+                    let path = '';
+                    let queryParams = {};
+
+                    // Try using URL for parsing
+                    const tempUrlForParsing = `http://${hostPortPathQueryString}`;
+                    try {
+                        const parsedTempUrl = new URL(tempUrlForParsing);
+                        host = parsedTempUrl.hostname;
+                        port = parsedTempUrl.port;
+                        path = parsedTempUrl.pathname;
+                        queryParams = Object.fromEntries(parsedTempUrl.searchParams.entries());
+                    } catch (e) {
+                        console.error("Failed to parse with URL constructor:", tempUrlForParsing, e);
+                        // Manual fallback
+                        const parts = hostPortPathQueryString.split('/');
+                        const hostPort = parts[0];
+                        host = hostPort.split(':')[0];
+                        port = hostPort.split(':')[1] || '';
+                        path = '/' + parts.slice(1).join('/').split('?')[0] || '/';
+                        const queryString = parts.slice(1).join('/').split('?')[1] || '';
+                        if (queryString) {
+                            queryString.split('&').forEach(param => {
+                                const [key, value] = param.split('=');
+                                if (key) {
+                                    queryParams[key] = value ? decodeURIComponent(value.replace(/\+/g, ' ')) : '';
+                                }
+                            });
+                        }
+                    }
+
+                    // Prioritize 'path' from query params if present
+                    const finalPath = queryParams.path ? decodeURIComponent(queryParams.path) : (path === '/' ? '' : path);
+
+                    const finalPort = port ? parseInt(port, 10) : (queryParams.security === 'tls' ? 443 : 80);
+
+                    return {
+                        type: protocol,
+                        userInfo: userInfo,
+                        server: host,
+                        port: finalPort,
+                        path: finalPath,
+                        params: queryParams,
+                        tag: hashPart || host
+                    };
+                }
+
+            } catch (e) {
+                console.error("Error parsing URL:", url, e);
+                return null;
+            }
+            return null;
+        }
+
+        function convertNodes() {
+            const nodeInput = document.getElementById('nodeInput').value;
+            const outputConfig = document.getElementById('outputConfig');
+            const errorMessage = document.getElementById('errorMessage');
+            const saveButton = document.getElementById('saveButton');
+
+            errorMessage.textContent = '';
+            outputConfig.value = '';
+            saveButton.disabled = true;
+
+            const nodeUrls = nodeInput.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+            const outbounds = [];
+            let defaultRouteOutboundTag = '';
+
+            nodeUrls.forEach(url => {
+                const parsed = parseUrl(url);
+                if (!parsed) {
+                    errorMessage.textContent += `无法解析节点: ${url}\n`;
+                    return;
+                }
+
+                if (parsed.type === 'hysteria2') {
+                    const tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    outbounds.push({
+                        type: 'hysteria2',
+                        tag: tag,
+                        server: parsed.server,
+                        server_port: parsed.port,
+                        password: parsed.password,
+                        tls: { enabled: true, insecure: parsed.insecure }
+                    });
+                    if (!defaultRouteOutboundTag) defaultRouteOutboundTag = tag;
+                } else if (parsed.type === 'vless') {
+                    const tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    const currentVlessTag = `${tag}-vless`;
+
+                    let tlsObj = {};
+                    if (parsed.params.security === 'reality') {
+                        tlsObj.enabled = true;
+                        tlsObj.server_name = parsed.params.sni || parsed.server;
+                        tlsObj.reality = { enabled: true, public_key: parsed.params.pbk, short_id: parsed.params.sid };
+                        if (parsed.params.fp) tlsObj.utls = { enabled: true, fingerprint: parsed.params.fp };
+                    } else if (parsed.params.security === 'tls') {
+                        tlsObj.enabled = true;
+                        tlsObj.server_name = parsed.params.sni || parsed.params.host || parsed.server;
+                    }
+
+                    let transportObj = null;
+                    const transType = parsed.params.headerType && parsed.params.headerType !== 'none' ? parsed.params.headerType : (parsed.params.type || '');
+                    if (transType && transType !== 'tcp') {
+                        transportObj = {
+                            type: transType,
+                            path: parsed.path || '/',
+                            headers: { Host: parsed.params.host || parsed.server }
+                        };
+                    }
+
+                    outbounds.push({
+                        type: 'vless',
+                        tag: currentVlessTag,
+                        server: parsed.server,
+                        server_port: parsed.port,
+                        uuid: parsed.userInfo,
+                        flow: parsed.params.flow || '',
+                        tls: tlsObj,
+                        ...(transportObj ? { transport: transportObj } : {})
+                    });
+                    if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentVlessTag;
+                } else if (parsed.type === 'trojan') {
+                    const tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    const currentTrojanTag = `${tag}-trojan`;
+
+                    let tlsObj = {};
+                    if (parsed.params.security === 'tls') {
+                        tlsObj.enabled = true;
+                        tlsObj.server_name = parsed.params.sni || parsed.params.host || parsed.server;
+                    }
+
+                    let transportObj = null;
+                    const transType = parsed.params.headerType && parsed.params.headerType !== 'none' ? parsed.params.headerType : (parsed.params.type || '');
+                    if (transType && transType !== 'tcp') {
+                        transportObj = {
+                            type: transType,
+                            path: parsed.path || '/',
+                            headers: { Host: parsed.params.host || parsed.server }
+                        };
+                    }
+
+                    outbounds.push({
+                        type: 'trojan',
+                        tag: currentTrojanTag,
+                        server: parsed.server,
+                        server_port: parsed.port,
+                        password: parsed.userInfo,
+                        tls: tlsObj,
+                        ...(transportObj ? { transport: transportObj } : {})
+                    });
+                    if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentTrojanTag;
+                } else if (parsed.type === 'vmess') {
+                    let tag = (parsed.ps || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    const currentVmessTag = `${tag}-vmess`;
+
+                    let tlsObj = null;
+                    if (parsed.tls === 'tls') {
+                        tlsObj = {
+                            enabled: true,
+                            server_name: parsed.sni || parsed.host || parsed.server
+                        };
+                    }
+
+                    let transportObj = null;
+                    const transType = parsed.net || 'tcp';
+                    if (transType !== 'tcp') {
+                        transportObj = {
+                            type: transType,
+                            path: parsed.path || '',
+                            headers: { Host: parsed.host || parsed.server }
+                        };
+                    }
+
+                    outbounds.push({
+                        type: 'vmess',
+                        tag: currentVmessTag,
+                        server: parsed.server,
+                        server_port: parseInt(parsed.port, 10),
+                        uuid: parsed.uuid,
+                        security: parsed.scy || 'auto',
+                        ...(transportObj ? { transport: transportObj } : {}),
+                        ...(tlsObj ? { tls: tlsObj } : {})
+                    });
+                    if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentVmessTag;
+                }
+            });
+
+            if (outbounds.length === 0) {
+                errorMessage.textContent = '没有解析到有效的节点信息。';
+                return;
+            }
+
+            if (!defaultRouteOutboundTag && outbounds.length > 0) {
+                defaultRouteOutboundTag = outbounds[0].tag;
+            }
+
+            const config = {
+                log: {
+                    level: "info"
+                },
+                inbounds: [{
+                    type: "http",
+                    tag: "http-in",
+                    listen: "127.0.0.1",
+                    listen_port: 10809
+                }],
+                outbounds: outbounds,
+                route: {
+                    rules: [{
+                        inbound: ["http-in"],
+                        outbound: defaultRouteOutboundTag
+                    }]
+                }
+            };
+
+            outputConfig.value = JSON.stringify(config, null, 2);
+            saveButton.disabled = false;
+        }
+
+        function saveConfig() {
+            const configContent = document.getElementById('outputConfig').value;
+            if (configContent) {
+                const blob = new Blob([configContent], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'config.json';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            } else {
+                document.getElementById('errorMessage').textContent = '没有内容可供保存，请先转换节点。';
+            }
+        }
+    </script>
+</body>
+</html>
