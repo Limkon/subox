@@ -262,10 +262,11 @@
                     let hostPortPathQueryString = coreAndParams;
 
                     const atIndex = coreAndParams.indexOf('@');
-                    if (atIndex !== -1) {
-                        userInfo = coreAndParams.substring(0, atIndex);
-                        hostPortPathQueryString = coreAndParams.substring(atIndex + 1);
+                    if (atIndex === -1) {
+                        throw new Error(`Invalid ${protocol} URL: No user info found.`);
                     }
+                    userInfo = coreAndParams.substring(0, atIndex);
+                    hostPortPathQueryString = coreAndParams.substring(atIndex + 1);
 
                     let host = '';
                     let port = '';
@@ -304,9 +305,16 @@
 
                     const finalPort = port ? parseInt(port, 10) : (queryParams.security === 'tls' ? 443 : 80);
 
+                    // Ensure UUID is properly set for VLESS
+                    const uuid = protocol === 'vless' ? userInfo : undefined;
+                    if (protocol === 'vless' && !uuid) {
+                        throw new Error("VLESS UUID is empty or missing.");
+                    }
+
                     return {
                         type: protocol,
-                        userInfo: userInfo,
+                        uuid: uuid, // Explicitly set for VLESS
+                        password: protocol === 'trojan' ? userInfo : undefined, // For Trojan
                         server: host,
                         port: finalPort,
                         path: finalPath,
@@ -407,7 +415,7 @@
                         tag: currentVlessTag,
                         server: parsed.server,
                         server_port: parsed.port,
-                        uuid: parsed.userInfo,
+                        uuid: parsed.uuid, // Use parsed.uuid instead of userInfo
                         flow: parsed.params.flow || '',
                         tls: tlsObj,
                         ...(transportObj ? { transport: transportObj } : {})
@@ -438,7 +446,7 @@
                         tag: currentTrojanTag,
                         server: parsed.server,
                         server_port: parsed.port,
-                        password: parsed.userInfo,
+                        password: parsed.password,
                         tls: tlsObj,
                         ...(transportObj ? { transport: transportObj } : {})
                     });
@@ -590,7 +598,6 @@
                         path = outbound.transport.path || '/';
                         host = outbound.transport.headers && outbound.transport.headers.Host ? outbound.transport.headers.Host : host;
                         if (transType === 'http') headerType = 'http';
-                        // Assume for now, adjust if needed
                     }
                     if (transType !== 'tcp') paramsStr += `type=${transType}&`;
                     if (headerType !== 'none') paramsStr += `headerType=${headerType}&`;
