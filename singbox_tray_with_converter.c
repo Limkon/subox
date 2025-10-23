@@ -1,11 +1,12 @@
 /* * singbox_tray_with_converter.c
- * * Refactored version with:
- * 1. Process Crash Monitoring (MonitorThread)
- * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
- * 3. Automatic Restart on Crash or Fatal Log Error
- * 4. Restart Cooldown (60s) to prevent restart loops
- * 5. Robust log buffer parsing
- * 6. (NEW) Log Viewer Window to display live sing-box output
+ * * 最终完整版 (2024-10-23)
+ * * 包含所有原始功能 (节点管理, 转换, 代理, 快捷键等)
+ * * 新增功能:
+ * 1. 进程崩溃监控 (MonitorThread)
+ * 2. 实时日志监控 (LogMonitorThread)
+ * 3. 错误/Fatal重启 (带60秒冷却)
+ * 4. 实时日志查看器窗口 (可隐藏)
+ * 5. 空闲超时重启 (180秒无日志输出则重启)
  */
 
 #define UNICODE
@@ -46,7 +47,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 
 #define WM_TRAY (WM_USER + 1)
 #define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
-#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求重启
+#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误/超时，请求重启 (wParam=0 错误, wParam=1 超时)
 #define WM_LOG_UPDATE (WM_USER + 4)          // 消息：日志线程发送新的日志文本
 
 #define ID_TRAY_EXIT 1001
@@ -496,7 +497,7 @@ DWORD WINAPI MonitorThread(LPVOID lpParam) {
     return 0;
 }
 
-// 监视 sing-box 核心进程日志输出的线程函数
+// 监视 sing-box 核心进程日志输出（和空闲）的线程函数
 DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
     char readBuf[4096];      // 原始读取缓冲区
     char lineBuf[8192] = {0}; // 拼接缓冲区，处理跨Read的日志行
@@ -506,72 +507,116 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
     const time_t RESTART_COOLDOWN = 60; // 60秒日志触发冷却
     HANDLE hPipe = (HANDLE)lpParam;
 
+    // --- 新增：空闲超时检测 ---
+    static time_t lastLogTime = 0;  // 我们最后一次收到日志的时间
+    const time_t IDLE_TIMEOUT = 180; // 180秒
+    DWORD bytesAvailable = 0;       // 管道中可用的字节数
+
+    lastLogTime = time(NULL); // 线程启动时，初始化计时器
+    // --- 新增结束 ---
+
     while (TRUE) {
-        // 从管道读取数据
-        bSuccess = ReadFile(hPipe, readBuf, sizeof(readBuf) - 1, &dwRead, NULL);
-        
-        if (!bSuccess || dwRead == 0) {
-            // 管道被破坏或关闭 (例如，sing-box 被终止)
-            break; // 线程退出
+        bytesAvailable = 0;
+        // 1. 使用 PeekNamedPipe 非阻塞地检查管道中是否有数据
+        bSuccess = PeekNamedPipe(hPipe, NULL, 0, NULL, &bytesAvailable, NULL);
+
+        if (!bSuccess) {
+            // Peek 失败，管道可能已损坏或被关闭
+            break; // 退出线程
         }
 
-        // 确保缓冲区以NULL结尾
-        readBuf[dwRead] = '\0';
+        // 2. 如果有数据，则读取和处理
+        if (bytesAvailable > 0) {
+            bSuccess = ReadFile(hPipe, readBuf, sizeof(readBuf) - 1, &dwRead, NULL);
+            
+            if (!bSuccess || dwRead == 0) {
+                // 即使 Peek 成功，ReadFile 也可能失败（例如，进程在 Peek 和 Read 之间终止）
+                break; // 退出线程
+            }
 
-        // --- 新增：转发日志到查看器窗口 ---
-        if (hLogViewerWnd != NULL && !g_isExiting) {
-            int wideLen = MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, NULL, 0);
-            if (wideLen > 0) {
-                // 为 wchar_t* 分配内存
-                wchar_t* pWideBuf = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
-                if (pWideBuf) {
-                    MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, pWideBuf, wideLen);
-                    
-                    // 异步发送消息，将内存指针作为lParam传递
-                    // 日志窗口的UI线程将负责 free(pWideBuf)
-                    if (!PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)pWideBuf)) {
-                        // 如果PostMessage失败（例如窗口正在关闭），我们必须在这里释放内存
-                        free(pWideBuf);
+            // --- *** 关键：重置空闲计时器 *** ---
+            lastLogTime = time(NULL);
+            // --- *** 重置结束 *** ---
+
+            // 确保缓冲区以NULL结尾
+            readBuf[dwRead] = '\0';
+
+            // --- 转发日志到查看器窗口 ---
+            if (hLogViewerWnd != NULL && !g_isExiting) {
+                int wideLen = MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, NULL, 0);
+                if (wideLen > 0) {
+                    // 为 wchar_t* 分配内存
+                    wchar_t* pWideBuf = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
+                    if (pWideBuf) {
+                        MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, pWideBuf, wideLen);
+                        
+                        // 异步发送消息，将内存指针作为lParam传递
+                        // 日志窗口的UI线程将负责 free(pWideBuf)
+                        if (!PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)pWideBuf)) {
+                            // 如果PostMessage失败（例如窗口正在关闭），我们必须在这里释放内存
+                            free(pWideBuf);
+                        }
                     }
                 }
             }
-        }
-        // --- 新增结束 ---
+            // --- 转发结束 ---
 
 
-        // 将新读取的数据附加到行缓冲区
-        strncat(lineBuf, readBuf, sizeof(lineBuf) - strlen(lineBuf) - 1);
+            // 将新读取的数据附加到行缓冲区
+            strncat(lineBuf, readBuf, sizeof(lineBuf) - strlen(lineBuf) - 1);
 
-        // 如果我们正在退出或切换，不要解析日志
-        if (g_isExiting) {
-            continue;
-        }
-
-        // --- 关键词分析 ---
-        // 查找可能需要重启的严重错误
-        char* fatal_pos = strstr(lineBuf, "level\"=\"fatal");
-        char* dial_pos = strstr(lineBuf, "failed to dial");
-
-        if (fatal_pos != NULL || dial_pos != NULL) {
-            time_t now = time(NULL);
-            if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
-                lastLogTriggeredRestart = now;
-                // 发送重启消息
-                PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 0, 0);
+            // 如果我们正在退出或切换，不要解析日志
+            if (g_isExiting) {
+                continue;
             }
-            // 处理完错误后，清空缓冲区，防止重复触发
-            lineBuf[0] = '\0';
-        } else {
-            // 如果没有找到错误，我们需要清理缓冲区，只保留最后一行（可能是半行）
-            char* last_newline = strrchr(lineBuf, '\n');
-            if (last_newline != NULL) {
-                // 找到了换行符，只保留换行符之后的内容
-                strcpy(lineBuf, last_newline + 1);
-            } else if (strlen(lineBuf) > 4096) {
-                // 缓冲区已满但没有换行符（异常情况），清空它以防溢出
+
+            // --- 关键词分析 ---
+            // 查找可能需要重启的严重错误
+            char* fatal_pos = strstr(lineBuf, "level\"=\"fatal");
+            char* dial_pos = strstr(lineBuf, "failed to dial");
+
+            if (fatal_pos != NULL || dial_pos != NULL) {
+                time_t now = time(NULL);
+                if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
+                    lastLogTriggeredRestart = now;
+                    // 发送重启消息 (wParam = 0 表示错误重启)
+                    PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 0, 0); 
+                }
+                // 处理完错误后，清空缓冲区，防止重复触发
                 lineBuf[0] = '\0';
+            } else {
+                // 如果没有找到错误，我们需要清理缓冲区，只保留最后一行（可能是半行）
+                char* last_newline = strrchr(lineBuf, '\n');
+                if (last_newline != NULL) {
+                    // 找到了换行符，只保留换行符之后的内容
+                    strcpy(lineBuf, last_newline + 1);
+                } else if (strlen(lineBuf) > 4096) {
+                    // 缓冲区已满但没有换行符（异常情况），清空它以防溢出
+                    lineBuf[0] = '\0';
+                }
+                // 如果没有换行符且缓冲区未满，则不执行任何操作，等待下一次 ReadFile 拼接
             }
-            // 如果没有换行符且缓冲区未满，则不执行任何操作，等待下一次 ReadFile 拼接
+        } 
+        // 3. 如果没有数据，则检查空闲超时
+        else {
+            time_t now = time(NULL);
+            // 检查是否超过180秒没有收到任何日志
+            if (!g_isExiting && (now - lastLogTime > IDLE_TIMEOUT)) {
+                
+                // 确保我们不会因为空闲而频繁重启（遵守60秒冷却）
+                if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
+                    lastLogTriggeredRestart = now;
+                    // 发送重启消息 (wParam = 1 表示空闲重启)
+                    PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 1, 0); 
+                }
+                
+                // 无论是否触发，都必须重置计时器
+                // 否则，在冷却期间，这个 if 会在每 500ms 触发一次
+                lastLogTime = now;
+            }
+
+            // 暂停 500ms，防止 CPU 100% 空转
+            Sleep(500); 
         }
     }
     
@@ -928,7 +973,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             if (msg == WM_SINGBOX_CRASHED) {
                 ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止，正在尝试重启...");
-            } else {
+            } 
+            // 检查 wParam 来区分重启原因
+            else if (msg == WM_SINGBOX_RECONNECT && wParam == 1) { // 1 = 空闲重启
+                ShowTrayTip(L"Sing-box 监控", L"核心空闲超时，正在重启以保持连接...");
+            } 
+            else { // 0 = 错误重启
                 ShowTrayTip(L"Sing-box 监控", L"检测到核心错误，正在尝试重启...");
             }
             
@@ -1098,8 +1148,7 @@ void CreateDefaultConfig() {
 }
 
 // =========================================================================
-// 节点管理功能实现
-// (以下代码与原版相同，未作修改)
+// 节点管理功能实现 (这部分是您原有的代码，已完整保留)
 // =========================================================================
 
 // 刷新节点管理窗口中的列表框
@@ -2206,13 +2255,15 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
                 // 性能优化：检查是否需要裁剪日志
                 int textLen = GetWindowTextLengthW(hEdit);
                 if (textLen > MAX_LOG_LENGTH) {
-                    // 裁剪：删除前 TRIM_LOG_LENGTH 个字符
-                    SendMessageW(hEdit, EM_SETSEL, 0, TRIM_LOG_LENGTH);
+                    // 裁剪：删除前 (MAX_LOG_LENGTH - TRIM_LOG_LENGTH) 个字符
+                    SendMessageW(hEdit, EM_SETSEL, 0, (MAX_LOG_LENGTH - TRIM_LOG_LENGTH));
                     SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)L"[... 日志已裁剪 ...]\r\n");
+                    // 重新获取长度并移动到末尾
+                    textLen = GetWindowTextLengthW(hEdit);
                 }
 
                 // 追加新文本
-                SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1); // 移动到文本末尾
+                SendMessageW(hEdit, EM_SETSEL, textLen, textLen); // 移动到文本末尾
                 SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)pLogChunk); // 追加新日志
                 
                 // 释放由 LogMonitorThread 分配的内存
