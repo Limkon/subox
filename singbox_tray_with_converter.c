@@ -1,3 +1,12 @@
+/* * singbox_tray_with_converter.c
+ * * Refactored version with:
+ * 1. Process Crash Monitoring (MonitorThread)
+ * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
+ * 3. Automatic Restart on Crash or Fatal Log Error
+ * 4. Restart Cooldown (60s) to prevent restart loops
+ * 5. Robust log buffer parsing
+ */
+
 #define UNICODE
 #define _UNICODE
 
@@ -15,6 +24,7 @@
 #include <wchar.h>
 #include <wininet.h>
 #include <commctrl.h>
+#include <time.h> // 用于重启冷却
 
 // 直接包含源文件以简化 TCC 编译过程
 #include "cJSON.c"
@@ -34,6 +44,9 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 
 
 #define WM_TRAY (WM_USER + 1)
+#define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
+#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求重启
+
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
 #define ID_TRAY_SYSTEM_PROXY 1003
@@ -98,6 +111,13 @@ BOOL g_isIconVisible = TRUE;
 UINT g_hotkeyModifiers = 0;
 UINT g_hotkeyVk = 0;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
+
+// --- 重构：新增守护功能全局变量 ---
+HANDLE hMonitorThread = NULL;           // 进程崩溃监控线程
+HANDLE hLogMonitorThread = NULL;        // 进程日志监控线程
+HANDLE hChildStd_OUT_Rd_Global = NULL;  // 核心进程的标准输出管道（读取端）
+BOOL g_isExiting = FALSE;               // 标记是否为用户主动退出/切换
+// --- 重构结束 ---
 
 // 用于在窗口间传递数据的结构体
 typedef struct {
@@ -442,30 +462,119 @@ int GetHttpInboundPort() {
     return httpPort;
 }
 
+
+// --- 重构：新增守护线程函数 ---
+
+// 监视 sing-box 核心进程是否崩溃的线程函数
+DWORD WINAPI MonitorThread(LPVOID lpParam) {
+    HANDLE hProcess = (HANDLE)lpParam;
+    
+    // 阻塞等待，直到 hProcess 进程终止
+    WaitForSingleObject(hProcess, INFINITE);
+
+    // 进程终止后，检查 g_isExiting 标志
+    // 如果不是用户主动退出（g_isExiting == FALSE），则向主窗口发送崩溃消息
+    if (!g_isExiting) {
+        PostMessageW(hwnd, WM_SINGBOX_CRASHED, 0, 0);
+    }
+
+    return 0;
+}
+
+// 监视 sing-box 核心进程日志输出的线程函数
+DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
+    char readBuf[4096];      // 原始读取缓冲区
+    char lineBuf[8192] = {0}; // 拼接缓冲区，处理跨Read的日志行
+    DWORD dwRead;
+    BOOL bSuccess;
+    static time_t lastLogTriggeredRestart = 0;
+    const time_t RESTART_COOLDOWN = 60; // 60秒日志触发冷却
+    HANDLE hPipe = (HANDLE)lpParam;
+
+    while (TRUE) {
+        // 从管道读取数据
+        bSuccess = ReadFile(hPipe, readBuf, sizeof(readBuf) - 1, &dwRead, NULL);
+        
+        if (!bSuccess || dwRead == 0) {
+            // 管道被破坏或关闭 (例如，sing-box 被终止)
+            break; // 线程退出
+        }
+
+        // 确保缓冲区以NULL结尾
+        readBuf[dwRead] = '\0';
+
+        // 将新读取的数据附加到行缓冲区
+        strncat(lineBuf, readBuf, sizeof(lineBuf) - strlen(lineBuf) - 1);
+
+        // 如果我们正在退出或切换，不要解析日志
+        if (g_isExiting) {
+            continue;
+        }
+
+        // --- 关键词分析 ---
+        // 查找可能需要重启的严重错误
+        char* fatal_pos = strstr(lineBuf, "level\"=\"fatal");
+        char* dial_pos = strstr(lineBuf, "failed to dial");
+
+        if (fatal_pos != NULL || dial_pos != NULL) {
+            time_t now = time(NULL);
+            if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
+                lastLogTriggeredRestart = now;
+                // 发送重启消息
+                PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 0, 0);
+            }
+            // 处理完错误后，清空缓冲区，防止重复触发
+            lineBuf[0] = '\0';
+        } else {
+            // 如果没有找到错误，我们需要清理缓冲区，只保留最后一行（可能是半行）
+            char* last_newline = strrchr(lineBuf, '\n');
+            if (last_newline != NULL) {
+                // 找到了换行符，只保留换行符之后的内容
+                strcpy(lineBuf, last_newline + 1);
+            } else if (strlen(lineBuf) > 4096) {
+                // 缓冲区已满但没有换行符（异常情况），清空它以防溢出
+                lineBuf[0] = '\0';
+            }
+            // 如果没有换行符且缓冲区未满，则不执行任何操作，等待下一次 ReadFile 拼接
+        }
+    }
+    
+    return 0;
+}
+// --- 重构结束 ---
+
+
+// --- 重构：修改 StartSingBox ---
 void StartSingBox() {
-    HANDLE hChildStd_OUT_Rd = NULL;
-    HANDLE hChildStd_OUT_Wr = NULL;
+    HANDLE hPipe_Rd_Local = NULL; // 管道读取端（本地）
+    HANDLE hPipe_Wr_Local = NULL; // 管道写入端（本地）
     SECURITY_ATTRIBUTES sa;
+
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
     sa.lpSecurityDescriptor = NULL;
 
-    if (!CreatePipe(&hChildStd_OUT_Rd, &hChildStd_OUT_Wr, &sa, 0)) {
+    // 创建用于 stdout/stderr 的管道
+    if (!CreatePipe(&hPipe_Rd_Local, &hPipe_Wr_Local, &sa, 0)) {
         ShowError(L"管道创建失败", L"无法为核心程序创建输出管道。");
         return;
     }
-    if (!SetHandleInformation(hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0)) {
+    // 确保管道的读取句柄不能被子进程继承
+    if (!SetHandleInformation(hPipe_Rd_Local, HANDLE_FLAG_INHERIT, 0)) {
         ShowError(L"管道句柄属性设置失败", L"无法设置输出管道读取句柄的属性。");
-        CloseHandle(hChildStd_OUT_Rd);
-        CloseHandle(hChildStd_OUT_Wr);
+        CloseHandle(hPipe_Rd_Local);
+        CloseHandle(hPipe_Wr_Local);
         return;
     }
+
+    // 将本地读取句柄保存到全局变量，以便日志线程使用
+    hChildStd_OUT_Rd_Global = hPipe_Rd_Local;
 
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     si.wShowWindow = SW_HIDE;
-    si.hStdOutput = hChildStd_OUT_Wr;
-    si.hStdError = hChildStd_OUT_Wr;
+    si.hStdOutput = hPipe_Wr_Local;
+    si.hStdError = hPipe_Wr_Local;
 
     wchar_t cmdLine[MAX_PATH];
     wcsncpy(cmdLine, L"sing-box.exe run -c config.json", ARRAYSIZE(cmdLine));
@@ -474,19 +583,23 @@ void StartSingBox() {
     if (!CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         ShowError(L"核心程序启动失败", L"无法创建 sing-box.exe 进程。");
         ZeroMemory(&pi, sizeof(pi));
-        CloseHandle(hChildStd_OUT_Rd);
-        CloseHandle(hChildStd_OUT_Wr);
+        CloseHandle(hChildStd_OUT_Rd_Global); // 清理全局句柄
+        hChildStd_OUT_Rd_Global = NULL;
+        CloseHandle(hPipe_Wr_Local);
         return;
     }
 
-    CloseHandle(hChildStd_OUT_Wr);
+    // 子进程已继承写入句柄，我们不再需要它
+    CloseHandle(hPipe_Wr_Local);
 
+    // 检查核心是否在500ms内立即退出（通常是配置错误）
     if (WaitForSingleObject(pi.hProcess, 500) == WAIT_OBJECT_0) {
         char chBuf[4096] = {0};
         DWORD dwRead = 0;
         wchar_t errorOutput[4096] = L"";
 
-        if (ReadFile(hChildStd_OUT_Rd, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
+        // 从管道读取初始错误输出
+        if (ReadFile(hChildStd_OUT_Rd_Global, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
             chBuf[dwRead] = '\0';
             MultiByteToWideChar(CP_UTF8, 0, chBuf, -1, errorOutput, ARRAYSIZE(errorOutput));
         }
@@ -494,19 +607,48 @@ void StartSingBox() {
         wchar_t fullMessage[8192];
         wsprintfW(fullMessage, L"sing-box.exe 核心程序启动后立即退出。\n\n可能的原因:\n- 配置文件(config.json)格式错误\n- 核心文件损坏或不兼容\n\n核心程序输出:\n%s", errorOutput);
         ShowError(L"核心程序启动失败", fullMessage);
+        
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         ZeroMemory(&pi, sizeof(pi));
+        
+        CloseHandle(hChildStd_OUT_Rd_Global); // 清理管道
+        hChildStd_OUT_Rd_Global = NULL;
+    } 
+    else {
+        // --- 进程启动成功，启动监控线程 ---
+
+        // 1. 启动崩溃监控线程
+        hMonitorThread = CreateThread(NULL, 0, MonitorThread, pi.hProcess, 0, NULL);
+        
+        // 2. 启动日志监控线程
+        // 我们必须复制管道句柄，因为 LogMonitorThread 会在退出时关闭它
+        HANDLE hPipeForLogThread;
+        if (DuplicateHandle(GetCurrentProcess(), hChildStd_OUT_Rd_Global,
+                           GetCurrentProcess(), &hPipeForLogThread, 0,
+                           FALSE, DUPLICATE_SAME_ACCESS))
+        {
+            hLogMonitorThread = CreateThread(NULL, 0, LogMonitorThread, hPipeForLogThread, 0, NULL);
+        }
+        // --- 监控启动完毕 ---
     }
 
-    CloseHandle(hChildStd_OUT_Rd);
+    // 注意：我们 *不* 在这里关闭 hChildStd_OUT_Rd_Global
+    // 它由 StopSingBox 统一关闭
 }
+// --- 重构结束 ---
 
 void SwitchNode(const wchar_t* tag) {
     SafeReplaceOutbound(tag);
     wcsncpy(currentNode, tag, ARRAYSIZE(currentNode) - 1);
     currentNode[ARRAYSIZE(currentNode)-1] = L'\0';
+    
+    // --- 重构：添加退出标志 ---
+    g_isExiting = TRUE; // 标记为主动操作，防止监控线程误报
     StopSingBox();
+    g_isExiting = FALSE; // 清除标志，准备重启
+    // --- 重构结束 ---
+
     StartSingBox();
     wchar_t message[256];
     wsprintfW(message, L"当前节点: %s", tag);
@@ -680,7 +822,13 @@ void UpdateMenu() {
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
 }
 
+
+// --- 重构：修改 WndProc ---
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // 自动重启的冷却计时器
+    static time_t lastAutoRestart = 0;
+    const time_t RESTART_COOLDOWN = 60; // 60秒
+
     if (msg == WM_TRAY && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)) {
         POINT pt;
         GetCursorPos(&pt);
@@ -695,6 +843,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     else if (msg == WM_COMMAND) {
         int id = LOWORD(wParam);
         if (id == ID_TRAY_EXIT) {
+            
+            g_isExiting = TRUE; // 标记为主动退出
+
             UnregisterHotKey(hWnd, ID_GLOBAL_HOTKEY);
             if(g_isIconVisible) Shell_NotifyIconW(NIM_DELETE, &nid);
             if (IsSystemProxyEnabled()) SetSystemProxy(FALSE);
@@ -721,18 +872,75 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleTrayIconVisibility();
         }
     }
+    // --- 新增：处理核心崩溃或日志错误 ---
+    else if (msg == WM_SINGBOX_CRASHED || msg == WM_SINGBOX_RECONNECT) {
+        time_t now = time(NULL);
+        // 检查是否在冷却时间内
+        if (now - lastAutoRestart > RESTART_COOLDOWN) {
+            lastAutoRestart = now; // 更新重启时间戳
+
+            if (msg == WM_SINGBOX_CRASHED) {
+                ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止，正在尝试重启...");
+            } else {
+                ShowTrayTip(L"Sing-box 监控", L"检测到核心错误，正在尝试重启...");
+            }
+            
+            g_isExiting = TRUE; // 标记，防止线程在清理时误报
+            StopSingBox();      // 安全停止并清理一切
+            g_isExiting = FALSE;// 清除标记
+            StartSingBox();     // 重新启动核心
+        }
+    }
+    // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
+// --- 重构结束 ---
 
+
+// --- 重构：修改 StopSingBox ---
 void StopSingBox() {
+    // 标记为正在退出，让监控线程自行终止
+    g_isExiting = TRUE; 
+
+    // 1. 停止核心进程
     if (pi.hProcess) {
-        TerminateProcess(pi.hProcess, 0);
-        WaitForSingleObject(pi.hProcess, 5000);
+        DWORD exitCode = 0;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        if (exitCode == STILL_ACTIVE) {
+            TerminateProcess(pi.hProcess, 0);
+            WaitForSingleObject(pi.hProcess, 5000);
+        }
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-        ZeroMemory(&pi, sizeof(pi));
     }
+    
+    // 2. 终止并清理崩溃监控线程
+    if (hMonitorThread) {
+        // 进程终止后，此线程会很快退出
+        WaitForSingleObject(hMonitorThread, 1000);
+        CloseHandle(hMonitorThread);
+    }
+
+    // 3. 终止并清理日志监控线程
+    if (hChildStd_OUT_Rd_Global) {
+        // 关闭管道的读取端，这将导致 LogMonitorThread 中的 ReadFile 失败
+        CloseHandle(hChildStd_OUT_Rd_Global);
+    }
+    if (hLogMonitorThread) {
+        // 等待日志线程安全退出
+        WaitForSingleObject(hLogMonitorThread, 1000);
+        CloseHandle(hLogMonitorThread);
+    }
+
+    // 4. 重置所有全局句柄
+    ZeroMemory(&pi, sizeof(pi));
+    hMonitorThread = NULL;
+    hLogMonitorThread = NULL;
+    hChildStd_OUT_Rd_Global = NULL;
+    
+    // g_isExiting 会在 StartSingBox 或程序退出前被重置
 }
+// --- 重构结束 ---
 
 void SetAutorun(BOOL enable) {
     HKEY hKey;
@@ -795,7 +1003,7 @@ void CreateDefaultConfig() {
     const char* defaultConfig =
         "{\n"
         "\t\"log\":\t{\n"
-        "\t\t\"level\":\t\"info\"\n"
+        "\t\t\"level\":\t\"info\"\n" // 保持 info 级别以供日志监控
         "\t},\n"
         "\t\"inbounds\":\t[{\n"
         "\t\t\t\"type\":\t\"http\",\n"
@@ -844,6 +1052,7 @@ void CreateDefaultConfig() {
 
 // =========================================================================
 // 节点管理功能实现
+// (以下代码与原版相同，未作修改)
 // =========================================================================
 
 // 刷新节点管理窗口中的列表框
@@ -1042,8 +1251,13 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
                         if (wasCurrentNode) {
                             MessageBoxW(hWnd, L"检测到当前活动节点已被修改，核心将自动重启以应用更改。", L"提示", MB_OK | MB_ICONINFORMATION);
+                            
+                            // --- 重构：使用安全重启 ---
+                            g_isExiting = TRUE;
                             StopSingBox();
+                            g_isExiting = FALSE;
                             StartSingBox();
+                            // --- 重构结束 ---
                         }
                     }
                     EnableWindow(hWnd, TRUE);
@@ -1999,12 +2213,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
 
+    // 确保启动前 g_isExiting 为 false
+    g_isExiting = FALSE;
     StartSingBox();
+    
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+    
+    // 程序退出前最后一次清理
+    if (!g_isExiting) {
+         g_isExiting = TRUE; // 确保在 GetMessage 循环外退出时也标记
+         StopSingBox(); 
+    }
+    
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_DELETE, &nid);
     }
