@@ -5,6 +5,7 @@
  * 3. Automatic Restart on Crash or Fatal Log Error
  * 4. Restart Cooldown (60s) to prevent restart loops
  * 5. Robust log buffer parsing
+ * 6. (NEW) Log Viewer Window to display live sing-box output
  */
 
 #define UNICODE
@@ -46,6 +47,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define WM_TRAY (WM_USER + 1)
 #define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
 #define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求重启
+#define WM_LOG_UPDATE (WM_USER + 4)          // 消息：日志线程发送新的日志文本
 
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
@@ -53,6 +55,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define ID_TRAY_OPEN_CONVERTER 1004
 #define ID_TRAY_SETTINGS 1005
 #define ID_TRAY_MANAGE_NODES 1006
+#define ID_TRAY_SHOW_CONSOLE 1007 // 新增：显示日志菜单ID
 #define ID_TRAY_NODE_BASE 2000
 
 // 节点管理窗口控件ID
@@ -79,6 +82,9 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define ID_ADD_OK_BTN 5002
 #define ID_ADD_CANCEL_BTN 5003
 #define ID_ADD_FORMAT_BTN 5004
+
+// 日志查看器窗口控件ID
+#define ID_LOGVIEWER_EDIT 6001
 
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_HOTKEY_CTRL 101
@@ -117,6 +123,10 @@ HANDLE hMonitorThread = NULL;           // 进程崩溃监控线程
 HANDLE hLogMonitorThread = NULL;        // 进程日志监控线程
 HANDLE hChildStd_OUT_Rd_Global = NULL;  // 核心进程的标准输出管道（读取端）
 BOOL g_isExiting = FALSE;               // 标记是否为用户主动退出/切换
+
+// --- 新增：日志窗口句柄 ---
+HWND hLogViewerWnd = NULL; // 日志查看器窗口句柄
+HFONT hLogFont = NULL;     // 日志窗口等宽字体
 // --- 重构结束 ---
 
 // 用于在窗口间传递数据的结构体
@@ -166,6 +176,11 @@ BOOL AddNodeToConfig(const char* newNodeContentJson);
 BOOL PinNodeByTag(const wchar_t* tagToPin);
 int DeduplicateNodes();
 BOOL SortNodesByName();
+
+// --- 重构：新增日志查看器函数声明 ---
+void OpenLogViewerWindow();
+LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+// --- 重构结束 ---
 
 
 // 辅助函数
@@ -503,6 +518,27 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
         // 确保缓冲区以NULL结尾
         readBuf[dwRead] = '\0';
 
+        // --- 新增：转发日志到查看器窗口 ---
+        if (hLogViewerWnd != NULL && !g_isExiting) {
+            int wideLen = MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, NULL, 0);
+            if (wideLen > 0) {
+                // 为 wchar_t* 分配内存
+                wchar_t* pWideBuf = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
+                if (pWideBuf) {
+                    MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, pWideBuf, wideLen);
+                    
+                    // 异步发送消息，将内存指针作为lParam传递
+                    // 日志窗口的UI线程将负责 free(pWideBuf)
+                    if (!PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)pWideBuf)) {
+                        // 如果PostMessage失败（例如窗口正在关闭），我们必须在这里释放内存
+                        free(pWideBuf);
+                    }
+                }
+            }
+        }
+        // --- 新增结束 ---
+
+
         // 将新读取的数据附加到行缓冲区
         strncat(lineBuf, readBuf, sizeof(lineBuf) - strlen(lineBuf) - 1);
 
@@ -799,6 +835,7 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
     free(newTagMb);
 }
 
+// --- 重构：修改 UpdateMenu ---
 void UpdateMenu() {
     if (hMenu) DestroyMenu(hMenu);
     if (hNodeSubMenu) DestroyMenu(hNodeSubMenu);
@@ -818,9 +855,11 @@ void UpdateMenu() {
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SYSTEM_PROXY, L"系统代理");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"设置快捷键");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"显示日志"); // 新增
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
 }
+// --- 重构结束 ---
 
 
 // --- 重构：修改 WndProc ---
@@ -846,6 +885,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             
             g_isExiting = TRUE; // 标记为主动退出
 
+            // --- 新增：销毁日志窗口 ---
+            if (hLogViewerWnd != NULL) {
+                DestroyWindow(hLogViewerWnd);
+            }
+            // --- 新增结束 ---
+
             UnregisterHotKey(hWnd, ID_GLOBAL_HOTKEY);
             if(g_isIconVisible) Shell_NotifyIconW(NIM_DELETE, &nid);
             if (IsSystemProxyEnabled()) SetSystemProxy(FALSE);
@@ -864,6 +909,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             OpenSettingsWindow();
         } else if (id == ID_TRAY_MANAGE_NODES) {
             OpenNodeManagerWindow();
+        } else if (id == ID_TRAY_SHOW_CONSOLE) { // --- 新增：处理日志窗口 ---
+            OpenLogViewerWindow();
         } else if (id >= ID_TRAY_NODE_BASE && id < ID_TRAY_NODE_BASE + nodeCount) {
             SwitchNode(nodeTags[id - ID_TRAY_NODE_BASE]);
         }
@@ -2123,6 +2170,138 @@ BOOL SortNodesByName() {
 
 
 // =========================================================================
+// (--- 新增 ---) 日志查看器功能实现
+// =========================================================================
+
+// 日志窗口过程函数
+LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static HWND hEdit = NULL;
+    // 定义日志缓冲区的大小限制，防止窗口因日志过多而卡死
+    const int MAX_LOG_LENGTH = 200000;  // 最大字符数
+    const int TRIM_LOG_LENGTH = 100000; // 裁剪后保留的字符数
+
+    switch (msg) {
+        case WM_CREATE: {
+            hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                    WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                                    ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+                                    0, 0, 0, 0, // 将在 WM_SIZE 中调整大小
+                                    hWnd, (HMENU)ID_LOGVIEWER_EDIT,
+                                    GetModuleHandle(NULL), NULL);
+            
+            if (hEdit == NULL) {
+                ShowError(L"创建失败", L"无法创建日志显示框。");
+                return -1; // 阻止窗口创建
+            }
+            
+            // 设置等宽字体
+            SendMessage(hEdit, WM_SETFONT, (WPARAM)hLogFont, TRUE);
+            break;
+        }
+
+        case WM_LOG_UPDATE: {
+            // 这是从 LogMonitorThread 线程接收到的消息
+            wchar_t* pLogChunk = (wchar_t*)lParam;
+            if (pLogChunk) {
+                // 性能优化：检查是否需要裁剪日志
+                int textLen = GetWindowTextLengthW(hEdit);
+                if (textLen > MAX_LOG_LENGTH) {
+                    // 裁剪：删除前 TRIM_LOG_LENGTH 个字符
+                    SendMessageW(hEdit, EM_SETSEL, 0, TRIM_LOG_LENGTH);
+                    SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)L"[... 日志已裁剪 ...]\r\n");
+                }
+
+                // 追加新文本
+                SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1); // 移动到文本末尾
+                SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)pLogChunk); // 追加新日志
+                
+                // 释放由 LogMonitorThread 分配的内存
+                free(pLogChunk);
+            }
+            break;
+        }
+
+        case WM_SIZE: {
+            // 窗口大小改变时，自动填满 EDIT 控件
+            RECT rcClient;
+            GetClientRect(hWnd, &rcClient);
+            MoveWindow(hEdit, 0, 0, rcClient.right, rcClient.bottom, TRUE);
+            break;
+        }
+
+        case WM_CLOSE: {
+            // 用户点击关闭时，只隐藏窗口，不销毁
+            // 这样下次打开时，日志历史还在
+            ShowWindow(hWnd, SW_HIDE);
+            hLogViewerWnd = NULL; // 标记为“已关闭”
+            break;
+        }
+
+        case WM_DESTROY: {
+            // 窗口被真正销毁时（例如程序退出时）
+            hLogViewerWnd = NULL;
+            break;
+        }
+
+        default:
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+// 打开或显示日志窗口
+void OpenLogViewerWindow() {
+    if (hLogViewerWnd != NULL) {
+        // 窗口已存在，只需显示并置顶
+        ShowWindow(hLogViewerWnd, SW_SHOW);
+        SetForegroundWindow(hLogViewerWnd);
+        return;
+    }
+
+    // 窗口不存在，需要创建
+    const wchar_t* LOGVIEWER_CLASS_NAME = L"SingboxLogViewerClass";
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = LogViewerWndProc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = LOGVIEWER_CLASS_NAME;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(GetModuleHandle(NULL), MAKEINTRESOURCE(1)); // 使用主程序图标
+    if (wc.hIcon == NULL) {
+        wc.hIcon = LoadIconW(NULL, IDI_APPLICATION); // 备用图标
+    }
+
+    if (!GetClassInfoW(wc.hInstance, LOGVIEWER_CLASS_NAME, &wc)) {
+        if (!RegisterClassW(&wc)) {
+            ShowError(L"窗口注册失败", L"无法注册日志窗口类。");
+            return;
+        }
+    }
+
+    hLogViewerWnd = CreateWindowExW(
+        0, LOGVIEWER_CLASS_NAME, L"Sing-box 实时日志",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 700, 450,
+        hwnd, // 父窗口设为主窗口，以便管理
+        NULL, wc.hInstance, NULL
+    );
+
+    if (hLogViewerWnd) {
+        // 尝试将窗口居中
+        RECT rc, rcOwner;
+        GetWindowRect(hLogViewerWnd, &rc);
+        GetWindowRect(GetDesktopWindow(), &rcOwner);
+        SetWindowPos(hLogViewerWnd, HWND_TOP,
+            (rcOwner.right - (rc.right - rc.left)) / 2,
+            (rcOwner.bottom - (rc.bottom - rc.top)) / 2,
+            0, 0, SWP_NOSIZE);
+    } else {
+        ShowError(L"窗口创建失败", L"无法创建日志窗口。");
+    }
+}
+
+
+// =========================================================================
 // 主函数
 // =========================================================================
 
@@ -2131,6 +2310,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     wchar_t guidString[40];
 
     g_hFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"宋体");
+
+    // --- 新增：创建日志等宽字体 ---
+    hLogFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    if (hLogFont == NULL) {
+        hLogFont = (HFONT)GetStockObject(SYSTEM_FIXED_FONT); // 备用字体
+    }
+    // --- 新增结束 ---
 
     wsprintfW(guidString, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
         APP_GUID.Data1, APP_GUID.Data2, APP_GUID.Data3,
@@ -2144,6 +2330,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         MessageBoxW(NULL, L"程序已在运行。", L"提示", MB_OK | MB_ICONINFORMATION);
         if (hMutex) CloseHandle(hMutex);
         if (g_hFont) DeleteObject(g_hFont);
+        if (hLogFont) DeleteObject(hLogFont); // 退出前清理
         return 0;
     }
 
@@ -2175,6 +2362,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         MessageBoxW(NULL, L"无法读取或解析 config.json 文件。", L"错误", MB_OK | MB_ICONERROR);
         if (hMutex) CloseHandle(hMutex);
         if (g_hFont) DeleteObject(g_hFont);
+        if (hLogFont) DeleteObject(hLogFont); // 退出前清理
         return 1;
     }
     const wchar_t* CLASS_NAME = L"TrayWindowClass";
@@ -2191,6 +2379,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     hwnd = CreateWindowExW(0, CLASS_NAME, L"TrayApp", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!hwnd) {
         if (g_hFont) DeleteObject(g_hFont);
+        if (hLogFont) DeleteObject(hLogFont); // 退出前清理
         return 1;
     }
 
@@ -2219,8 +2408,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        // --- 新增：检查是否是日志窗口的消息 ---
+        // IsDialogMessage 允许在日志窗口的 EDIT 控件中使用 TAB 键
+        if (hLogViewerWnd == NULL || !IsDialogMessageW(hLogViewerWnd, &msg)) {
+             TranslateMessage(&msg);
+             DispatchMessage(&msg);
+        }
+        // --- 新增结束 ---
     }
     
     // 程序退出前最后一次清理
@@ -2235,6 +2429,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     CleanupDynamicNodes();
     if (hMutex) CloseHandle(hMutex);
     UnregisterClassW(CLASS_NAME, hInstance);
+    
+    // --- 新增：清理字体 ---
+    if (hLogFont) DeleteObject(hLogFont);
+    // --- 新增结束 ---
+    
     if (g_hFont) DeleteObject(g_hFont);
     return (int)msg.wParam;
 }
