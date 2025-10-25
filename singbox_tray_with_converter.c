@@ -2,8 +2,8 @@
  * * Refactored version with:
  * 1. Process Crash Monitoring (MonitorThread)
  * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
- * 3. Automatic Restart on Crash or Fatal Log Error
- * 4. Restart Cooldown (60s) to prevent restart loops
+ * 3. (REMOVED) Automatic Restart on Crash or Fatal Log Error (to maintain network stability)
+ * 4. Restart Cooldown (60s) (no longer used for restart, only for logging)
  * 5. Robust log buffer parsing
  * 6. (NEW) Log Viewer Window to display live sing-box output
  */
@@ -556,7 +556,7 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
             time_t now = time(NULL);
             if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
                 lastLogTriggeredRestart = now;
-                // 发送重启消息
+                // 发送重启消息 (注意：主窗口已设置为不重启)
                 PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 0, 0);
             }
             // 处理完错误后，清空缓冲区，防止重复触发
@@ -862,11 +862,11 @@ void UpdateMenu() {
 // --- 重构结束 ---
 
 
-// --- 重构：修改 WndProc ---
+// --- 重构：修改 WndProc (移除自动重启) ---
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // 自动重启的冷却计时器
     static time_t lastAutoRestart = 0;
-    const time_t RESTART_COOLDOWN = 60; // 60秒
+    const time_t RESTART_COOLDOWN = 60; // 60秒 (保留定义，但不再用于重启)
 
     if (msg == WM_TRAY && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)) {
         POINT pt;
@@ -919,24 +919,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleTrayIconVisibility();
         }
     }
-    // --- 新增：处理核心崩溃或日志错误 ---
+    // --- 新增：处理核心崩溃或日志错误 (已移除自动重启) ---
     else if (msg == WM_SINGBOX_CRASHED || msg == WM_SINGBOX_RECONNECT) {
-        time_t now = time(NULL);
+        
+        // -- 自动重启逻辑已移除 --
+        // time_t now = time(NULL);
         // 检查是否在冷却时间内
-        if (now - lastAutoRestart > RESTART_COOLDOWN) {
-            lastAutoRestart = now; // 更新重启时间戳
+        // if (now - lastAutoRestart > RESTART_COOLDOWN) {
+        //    lastAutoRestart = now; // 更新重启时间戳
 
             if (msg == WM_SINGBOX_CRASHED) {
-                ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止，正在尝试重启...");
+                ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止。请手动检查。");
             } else {
-                ShowTrayTip(L"Sing-box 监控", L"检测到核心错误，正在尝试重启...");
+                ShowTrayTip(L"Sing-box 监控", L"检测到核心错误。请手动检查。");
             }
             
-            g_isExiting = TRUE; // 标记，防止线程在清理时误报
-            StopSingBox();      // 安全停止并清理一切
-            g_isExiting = FALSE;// 清除标记
-            StartSingBox();     // 重新启动核心
-        }
+            // g_isExiting = TRUE; // 标记，防止线程在清理时误报
+            // StopSingBox();      // 安全停止并清理一切
+            // g_isExiting = FALSE;// 清除标记
+            // StartSingBox();     // 重新启动核心
+        // }
+        // -- 自动重启逻辑已移除 --
     }
     // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
