@@ -6,7 +6,7 @@
  * 4. Auto-Switch Cooldown (60s)
  * 5. Robust log buffer parsing
  * 6. (NEW) Log Viewer Window to display live sing-box output
- * 7. (NEW) Auto-fix duplicate tags on startup
+ * 7. (NEW) Auto-fix duplicate tags on startup (silently)
  */
 
 #define UNICODE
@@ -2593,12 +2593,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         return 1;
     }
 
-    // --- 新增：自动检测并修复重复标签 ---
+    // --- 修改：自动检测并修复重复标签 (静默) ---
     int renamedCount = FixDuplicateTags();
     if (renamedCount > 0) {
-        wchar_t msg[256];
-        wsprintfW(msg, L"检测到 %d 个重复的节点标签并已自动修复。\n\n程序将加载修复后的配置。", renamedCount);
-        MessageBoxW(NULL, msg, L"自动修复提示", MB_OK | MB_ICONINFORMATION);
+        // --- 移除了提示框 ---
         
         // 必须重新加载配置，因为 FixDuplicateTags 已经修改了 config.json
         if (!ParseTags()) {
@@ -2609,9 +2607,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
             return 1;
         }
     } else if (renamedCount == -1) {
+        // 保留错误提示，因为这可能是文件权限问题
         MessageBoxW(NULL, L"尝试自动修复重复标签时发生错误。\n请检查 config.json 文件权限。", L"修复错误", MB_OK | MB_ICONWARNING);
     }
-    // --- 自动修复结束 ---
+    // --- 修改结束 ---
 
 
     const wchar_t* CLASS_NAME = L"TrayWindowClass";
