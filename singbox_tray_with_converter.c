@@ -2,10 +2,11 @@
  * * Refactored version with:
  * 1. Process Crash Monitoring (MonitorThread)
  * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
- * 3. (REMOVED) Automatic Restart on Crash or Fatal Log Error (to maintain network stability)
- * 4. Restart Cooldown (60s) (no longer used for restart, only for logging)
+ * 3. (NEW) Automatic Node Switching on connection errors (timeout, refused)
+ * 4. Auto-Switch Cooldown (60s)
  * 5. Robust log buffer parsing
  * 6. (NEW) Log Viewer Window to display live sing-box output
+ * 7. (NEW) Auto-fix duplicate tags on startup
  */
 
 #define UNICODE
@@ -46,7 +47,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 
 #define WM_TRAY (WM_USER + 1)
 #define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
-#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求重启
+#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求自动切换
 #define WM_LOG_UPDATE (WM_USER + 4)          // 消息：日志线程发送新的日志文本
 
 #define ID_TRAY_EXIT 1001
@@ -69,6 +70,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define ID_NODEMGR_CONTEXT_PIN_NODE 3008
 #define ID_NODEMGR_CONTEXT_DEDUPLICATE 3009
 #define ID_NODEMGR_CONTEXT_SORT_NODES 3010
+// 移除了 ID_NODEMGR_CONTEXT_FIX_DUPLICATE_TAGS
 
 
 // 修改节点对话框控件ID
@@ -176,6 +178,7 @@ BOOL AddNodeToConfig(const char* newNodeContentJson);
 BOOL PinNodeByTag(const wchar_t* tagToPin);
 int DeduplicateNodes();
 BOOL SortNodesByName();
+int FixDuplicateTags(); // 启动时自动修复功能
 
 // --- 重构：新增日志查看器函数声明 ---
 void OpenLogViewerWindow();
@@ -551,12 +554,15 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
         // 查找可能需要重启的严重错误
         char* fatal_pos = strstr(lineBuf, "level\"=\"fatal");
         char* dial_pos = strstr(lineBuf, "failed to dial");
+        // 新增：检测 timeout 和 connection refused
+        char* timeout_pos = strstr(lineBuf, "timeout"); 
+        char* refused_pos = strstr(lineBuf, "connection refused");
 
-        if (fatal_pos != NULL || dial_pos != NULL) {
+        if (fatal_pos != NULL || dial_pos != NULL || timeout_pos != NULL || refused_pos != NULL) {
             time_t now = time(NULL);
             if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
                 lastLogTriggeredRestart = now;
-                // 发送重启消息 (注意：主窗口已设置为不重启)
+                // 发送重启消息 (现在将触发节点切换)
                 PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 0, 0);
             }
             // 处理完错误后，清空缓冲区，防止重复触发
@@ -862,11 +868,11 @@ void UpdateMenu() {
 // --- 重构结束 ---
 
 
-// --- 重构：修改 WndProc (移除自动重启) ---
+// --- 重构：修改 WndProc (增加自动切换节点) ---
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // 自动重启的冷却计时器
     static time_t lastAutoRestart = 0;
-    const time_t RESTART_COOLDOWN = 60; // 60秒 (保留定义，但不再用于重启)
+    const time_t RESTART_COOLDOWN = 60; // 60秒 (保留定义，用于崩溃提示)
 
     if (msg == WM_TRAY && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)) {
         POINT pt;
@@ -919,27 +925,66 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleTrayIconVisibility();
         }
     }
-    // --- 新增：处理核心崩溃或日志错误 (已移除自动重启) ---
-    else if (msg == WM_SINGBOX_CRASHED || msg == WM_SINGBOX_RECONNECT) {
+    // --- 重构：处理核心崩溃或日志错误 (新增自动切换) ---
+    else if (msg == WM_SINGBOX_CRASHED) {
+        // 核心崩溃，只提示，不自动操作
+        ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止。请手动检查。");
+    }
+    else if (msg == WM_SINGBOX_RECONNECT) {
+        // 日志检测到错误（如 timeout），执行自动切换节点
         
-        // -- 自动重启逻辑已移除 --
-        // time_t now = time(NULL);
-        // 检查是否在冷却时间内
-        // if (now - lastAutoRestart > RESTART_COOLDOWN) {
-        //    lastAutoRestart = now; // 更新重启时间戳
+        // 自动切换的冷却计时器
+        static time_t lastAutoSwitch = 0;
+        const time_t SWITCH_COOLDOWN = 60; // 60秒冷却，防止频繁切换
+        time_t now = time(NULL);
 
-            if (msg == WM_SINGBOX_CRASHED) {
-                ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止。请手动检查。");
+        // 检查是否在冷却时间内
+        if (now - lastAutoSwitch > SWITCH_COOLDOWN) {
+            lastAutoSwitch = now; // 更新切换时间戳
+
+            // 1. 重新解析以获取最新的节点列表
+            ParseTags(); 
+            if (nodeCount <= 1) {
+                 // 只有一个或没有节点，无需切换
+                 ShowTrayTip(L"自动切换", L"检测到连接错误，但无其他节点可切换。");
+                 return DefWindowProcW(hWnd, msg, wParam, lParam);
+            }
+
+            // 2. 找到当前节点的索引
+            int currentIndex = -1;
+            for (int i = 0; i < nodeCount; i++) {
+                if (wcscmp(nodeTags[i], currentNode) == 0) {
+                    currentIndex = i;
+                    break;
+                }
+            }
+
+            // 3. 计算下一个节点的索引（顺序循环切换）
+            int nextIndex;
+            if (currentIndex == -1 || (currentIndex + 1) >= nodeCount) {
+                nextIndex = 0; // 如果找不到当前节点或已是最后一个，则切换到第一个
             } else {
-                ShowTrayTip(L"Sing-box 监控", L"检测到核心错误。请手动检查。");
+                nextIndex = currentIndex + 1; // 切换到下一个
             }
             
-            // g_isExiting = TRUE; // 标记，防止线程在清理时误报
-            // StopSingBox();      // 安全停止并清理一切
-            // g_isExiting = FALSE;// 清除标记
-            // StartSingBox();     // 重新启动核心
-        // }
-        // -- 自动重启逻辑已移除 --
+            const wchar_t* nextNodeTag = nodeTags[nextIndex];
+
+            // 4. 避免切换到自己（当只有一个节点时）
+            if (wcscmp(currentNode, nextNodeTag) == 0) {
+                 ShowTrayTip(L"自动切换", L"检测到连接错误，但无其他节点可切换。");
+                 return DefWindowProcW(hWnd, msg, wParam, lParam);
+            }
+
+            // 5. 执行切换
+            wchar_t message[256];
+            wsprintfW(message, L"检测到连接错误，自动切换到: %s", nextNodeTag);
+            ShowTrayTip(L"自动切换节点", message);
+
+            // 调用现有的切换函数
+            SwitchNode(nextNodeTag);
+
+        }
+        // 如果在冷却时间内，则不执行任何操作
     }
     // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -1102,7 +1147,6 @@ void CreateDefaultConfig() {
 
 // =========================================================================
 // 节点管理功能实现
-// (以下代码与原版相同，未作修改)
 // =========================================================================
 
 // 刷新节点管理窗口中的列表框
@@ -1171,7 +1215,8 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 HMENU hContextMenu = CreatePopupMenu();
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_PIN_NODE, L"置顶节点");
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_SORT_NODES, L"节点排序");
-                AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_DEDUPLICATE, L"节点去重");
+                AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_DEDUPLICATE, L"节点去重 (内容)");
+                // 移除了 "修复重复标签" 菜单项
                 AppendMenuW(hContextMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_SELECT_ALL, L"全部选择");
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_DESELECT_ALL, L"全部取消");
@@ -1214,7 +1259,7 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     int removedCount = DeduplicateNodes();
                     if (removedCount >= 0) {
                         wchar_t msg[128];
-                        wsprintfW(msg, L"操作完成，成功移除了 %d 个重复节点。", removedCount);
+                        wsprintfW(msg, L"操作完成，成功移除了 %d 个内容重复的节点。", removedCount);
                         MessageBoxW(hWnd, msg, L"去重完成", MB_OK | MB_ICONINFORMATION);
                         ParseTags();
                         RefreshNodeListBox(hListBox);
@@ -1223,6 +1268,9 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     }
                     break;
                 }
+                
+                // 移除了 ID_NODEMGR_CONTEXT_FIX_DUPLICATE_TAGS 的 case 处理
+
                 case ID_NODEMGR_CONTEXT_SELECT_ALL:
                     SendMessage(hListBox, LB_SETSEL, TRUE, -1);
                     break;
@@ -1334,7 +1382,7 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     }
 
                     if (deletingCurrent) {
-                        MessageBoxW(hWnd, L"无法删除当前正在使用的节点。请取消对当前节点的选择。", L"操作禁止", MB_OK | MB_ICONWARNING);
+                        MessageBoxW(hWnd, L"无法删除当前正在使用的节点。请取消对当前节点的的选择。", L"操作禁止", MB_OK | MB_ICONWARNING);
                         free(selItems);
                         break;
                     }
@@ -1677,7 +1725,8 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                          }
                          free(newTagW);
                          if (duplicate) {
-                             MessageBoxW(hWnd, L"节点名称已存在，请使用其他名称。", L"错误", MB_OK | MB_ICONERROR);
+                             // 启动时已自动修复，但此处保留检查以防万一
+                             MessageBoxW(hWnd, L"节点名称已存在，请使用其他名称。\n(程序启动时会自动修复重复标签)", L"错误", MB_OK | MB_ICONERROR);
                              cJSON_Delete(newNodeJson); free(newContentMb);
                              return 0;
                          }
@@ -2171,6 +2220,180 @@ BOOL SortNodesByName() {
     return success;
 }
 
+/**
+ * @brief 自动修复配置文件中重复的 "tag" 名称。
+ * * 遍历所有 outbounds，如果发现 "tag" 名称已存在，
+ * 则自动附加 "(1)", "(2)" 等后缀，直到名称唯一。
+ * * 同时，如果当前活动节点被重命名，会自动更新 'route' 部分。
+ * * @return int 成功重命名的节点数量。
+ * 0   表示没有发现重复项。
+ * -1  表示发生错误 (如文件读写失败, JSON格式错误)。
+ */
+int FixDuplicateTags() {
+    char* buffer = NULL;
+    long size = 0;
+    if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return -1;
+
+    cJSON* root = cJSON_Parse(buffer);
+    free(buffer);
+    if (!root) return -1;
+
+    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
+    if (!cJSON_IsArray(outbounds)) {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    int count = cJSON_GetArraySize(outbounds);
+    if (count <= 1) {
+        cJSON_Delete(root);
+        return 0; // 只有一个或没有节点，不可能重复
+    }
+
+    // 创建一个 "已使用标签" 列表
+    // 使用 calloc 确保所有指针初始化为 NULL
+    char** seenTags = (char**)calloc(count, sizeof(char*));
+    if (!seenTags) {
+        cJSON_Delete(root);
+        return -1;
+    }
+    int seenCount = 0;
+    int renamedCount = 0;
+    BOOL hasChanges = FALSE;
+    char* currentActiveTagMb = NULL;
+    
+    // 转换当前活动节点标签 (wchar_t -> char*)
+    int mbLen = WideCharToMultiByte(CP_UTF8, 0, currentNode, -1, NULL, 0, NULL, NULL);
+    currentActiveTagMb = (char*)malloc(mbLen);
+    if (currentActiveTagMb) {
+         WideCharToMultiByte(CP_UTF8, 0, currentNode, -1, currentActiveTagMb, mbLen, NULL, NULL);
+    }
+
+
+    cJSON* node = NULL;
+    cJSON_ArrayForEach(node, outbounds) {
+        cJSON* tagItem = cJSON_GetObjectItem(node, "tag");
+        if (!cJSON_IsString(tagItem) || !tagItem->valuestring || strlen(tagItem->valuestring) == 0) {
+            continue; // 跳过没有标签或标签为空的节点
+        }
+
+        char* currentTag = tagItem->valuestring;
+        BOOL isDuplicate = FALSE;
+
+        // 检查 "seenTags" 列表中是否已存在该标签
+        for (int i = 0; i < seenCount; i++) {
+            if (strcmp(seenTags[i], currentTag) == 0) {
+                isDuplicate = TRUE;
+                break;
+            }
+        }
+
+        if (isDuplicate) {
+            // 发现重复标签，必须重命名
+            int suffix = 1;
+            char newTagBuffer[512]; // 假设标签名不会超长
+            BOOL uniqueTagFound = FALSE;
+
+            while (!uniqueTagFound) {
+                // 构造新标签名，例如 "SEA-vless (1)"
+                snprintf(newTagBuffer, sizeof(newTagBuffer), "%s (%d)", currentTag, suffix);
+
+                // 检查这个 *新构造* 的标签是否也已存在
+                BOOL newTagConflict = FALSE;
+                for (int i = 0; i < seenCount; i++) {
+                    if (strcmp(seenTags[i], newTagBuffer) == 0) {
+                        newTagConflict = TRUE;
+                        break;
+                    }
+                }
+
+                if (!newTagConflict) {
+                    // 找到了一个独一无二的新名称
+                    uniqueTagFound = TRUE;
+                    
+                    BOOL isCurrentActiveNode = (currentActiveTagMb && strcmp(currentTag, currentActiveTagMb) == 0);
+
+                    // 1. 修改 cJSON 'outbounds' 对象中的 "tag" 值
+                    cJSON_SetValuestring(tagItem, newTagBuffer);
+                    
+                    // 2. 如果被重命名的是当前活动节点，
+                    //    我们必须 *在同一个 cJSON root* 中更新 'route' 部分
+                    if (isCurrentActiveNode) {
+                        cJSON* route = cJSON_GetObjectItem(root, "route");
+                        if (route) {
+                            BOOL updated = FALSE;
+                            cJSON* rules = cJSON_GetObjectItem(route, "rules");
+                            if (cJSON_IsArray(rules) && cJSON_GetArraySize(rules) > 0) {
+                                cJSON* first_rule = cJSON_GetArrayItem(rules, 0);
+                                if (first_rule) {
+                                    cJSON* rule_outbound = cJSON_GetObjectItem(first_rule, "outbound");
+                                    // 检查路由是否指向 *旧的* 标签名
+                                    if (rule_outbound && strcmp(rule_outbound->valuestring, currentActiveTagMb) == 0) {
+                                        cJSON_SetValuestring(rule_outbound, newTagBuffer); // 设置为 *新的* 标签名
+                                        updated = TRUE;
+                                    }
+                                }
+                            }
+                            if (!updated) {
+                                cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
+                                // 检查 'final' 是否指向 *旧的* 标签名
+                                if (final_outbound && strcmp(final_outbound->valuestring, currentActiveTagMb) == 0) {
+                                    cJSON_SetValuestring(final_outbound, newTagBuffer); // 设置为 *新的* 标签名
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. 将这个新名称添加到 "seenTags" 列表中
+                    seenTags[seenCount] = strdup(newTagBuffer);
+                    if (seenTags[seenCount]) {
+                        seenCount++;
+                    }
+                    
+                    renamedCount++;
+                    hasChanges = TRUE;
+                } else {
+                    // 新名称依然冲突 (例如 "Tag (1)" 已存在)，增加后缀重试
+                    suffix++;
+                }
+            }
+        } else {
+            // 标签不重复，将其添加到 "seenTags" 列表
+            seenTags[seenCount] = strdup(currentTag);
+            if (seenTags[seenCount]) {
+                seenCount++;
+            }
+        }
+    }
+
+    // 释放 "seenTags" 列表及其中的字符串
+    for (int i = 0; i < seenCount; i++) {
+        free(seenTags[i]);
+    }
+    free(seenTags);
+    if(currentActiveTagMb) free(currentActiveTagMb);
+
+    if (hasChanges) {
+        // 如果有修改，则写回 config.json 文件
+        char* newContent = cJSON_PrintBuffered(root, 1, 1);
+        if (newContent) {
+            FILE* out = NULL;
+            if (_wfopen_s(&out, L"config.json", L"wb") == 0 && out != NULL) {
+                fwrite(newContent, 1, strlen(newContent), out);
+                fclose(out);
+            } else {
+                renamedCount = -1; // 标记文件写入失败
+            }
+            free(newContent);
+        } else {
+            renamedCount = -1; // 标记 cJSON 打印失败
+        }
+    }
+
+    cJSON_Delete(root);
+    return renamedCount;
+}
+
 
 // =========================================================================
 // (--- 新增 ---) 日志查看器功能实现
@@ -2361,6 +2584,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     }
 
     LoadSettings();
+    // 第一次加载配置
     if (!ParseTags()) {
         MessageBoxW(NULL, L"无法读取或解析 config.json 文件。", L"错误", MB_OK | MB_ICONERROR);
         if (hMutex) CloseHandle(hMutex);
@@ -2368,6 +2592,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         if (hLogFont) DeleteObject(hLogFont); // 退出前清理
         return 1;
     }
+
+    // --- 新增：自动检测并修复重复标签 ---
+    int renamedCount = FixDuplicateTags();
+    if (renamedCount > 0) {
+        wchar_t msg[256];
+        wsprintfW(msg, L"检测到 %d 个重复的节点标签并已自动修复。\n\n程序将加载修复后的配置。", renamedCount);
+        MessageBoxW(NULL, msg, L"自动修复提示", MB_OK | MB_ICONINFORMATION);
+        
+        // 必须重新加载配置，因为 FixDuplicateTags 已经修改了 config.json
+        if (!ParseTags()) {
+            MessageBoxW(NULL, L"自动修复后无法重新加载 config.json。", L"错误", MB_OK | MB_ICONERROR);
+            if (hMutex) CloseHandle(hMutex);
+            if (g_hFont) DeleteObject(g_hFont);
+            if (hLogFont) DeleteObject(hLogFont);
+            return 1;
+        }
+    } else if (renamedCount == -1) {
+        MessageBoxW(NULL, L"尝试自动修复重复标签时发生错误。\n请检查 config.json 文件权限。", L"修复错误", MB_OK | MB_ICONWARNING);
+    }
+    // --- 自动修复结束 ---
+
+
     const wchar_t* CLASS_NAME = L"TrayWindowClass";
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = WndProc;
