@@ -7,17 +7,17 @@
 		"servers":	[{
 				"tag":	"dns_resolver-tx",
 				"address":	"119.29.29.29",
-				"detour":	"out-direct"
+				"detour":	"直接连接"
 			}, {
 				"tag":	"dns-direct-tx",
 				"address":	"https://doh.pub/dns-query",
 				"address_resolver":	"dns_resolver-tx",
-				"detour":	"out-direct"
+				"detour":	"直接连接"
 			}, {
 				"tag":	"dns-proxy-cf",
 				"address":	"https://cloudflare-dns.com/dns-query",
 				"address_resolver":	"dns_resolver-tx",
-				"detour":	"out-proxy"
+				"detour":	"自动切换"
 			}, {
 				"tag":	"dns-block",
 				"address":	"rcode://refused"
@@ -37,15 +37,15 @@
 			"listen_port":	10809
 		}],
 	"outbounds":	[{
-			"tag":	"out-direct",
+			"tag":	"直接连接",
 			"type":	"direct"
 		}, {
-			"tag":	"out-block",
+			"tag":	"阻塞",
 			"type":	"block"
 		}, {
-			"tag":	"out-proxy",
+			"tag":	"自动切换",
 			"type":	"selector",
-			"outbounds":	["vless-tw", "vless-sg", "vless-usa", "trojan-tw", "trojan-sg", "trojan-usa"],
+			"outbounds":	["vless-tw", "vless-sg", "vless-usa", "trojan-tw", "trojan-sg", "trojan-usa", "直接连接", "阻塞"],
 			"default":	"vless-usa"
 		}, {
 			"tag":	"vless-tw",
@@ -152,10 +152,13 @@
 		}],
 	"route":	{
 		"rules":	[{
+				"domain_suffix":	["visa.com.tw", "visa.com.sg", "visa.com", "abrdns.com", "doh.pub", "cloudflare-dns.com"],
+				"outbound":	"直接连接"
+			}, {
 				"ip_cidr":	["119.29.29.29", "120.53.53.53"],
-				"outbound":	"out-proxy"
+				"outbound":	"直接连接"
 			}],
-		"final":	"out-proxy",
+		"final":	"自动切换",
 		"auto_detect_interface":	true,
 		"find_process":	true
 	},
