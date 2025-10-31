@@ -7,6 +7,8 @@
  * 5. Robust log buffer parsing
  * 6. (NEW) Log Viewer Window to display live sing-box output
  * 7. (NEW) Auto-fix duplicate tags on startup (silently)
+ *
+ * (Modification): Node switching now targets 'route.final'
  */
 
 #define UNICODE
@@ -400,6 +402,9 @@ void OpenSettingsWindow() {
     }
 }
 
+// =========================================================================
+// (已修改) 解析 config.json 以获取节点列表和当前节点 (读取 route.final)
+// =========================================================================
 BOOL ParseTags() {
     CleanupDynamicNodes();
     currentNode[0] = L'\0';
@@ -442,21 +447,11 @@ BOOL ParseTags() {
     }
     cJSON* route = cJSON_GetObjectItem(root, "route");
     if (route) {
-        cJSON* rules = cJSON_GetObjectItem(route, "rules");
-        if (cJSON_IsArray(rules) && cJSON_GetArraySize(rules) > 0) {
-            cJSON* first_rule = cJSON_GetArrayItem(rules, 0);
-            if (first_rule) {
-                cJSON* rule_outbound = cJSON_GetObjectItem(first_rule, "outbound");
-                if (cJSON_IsString(rule_outbound) && rule_outbound->valuestring) {
-                    MultiByteToWideChar(CP_UTF8, 0, rule_outbound->valuestring, -1, currentNode, ARRAYSIZE(currentNode));
-                }
-            }
-        }
-        if (currentNode[0] == L'\0') {
-            cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
-            if (cJSON_IsString(final_outbound) && final_outbound->valuestring) {
-                MultiByteToWideChar(CP_UTF8, 0, final_outbound->valuestring, -1, currentNode, ARRAYSIZE(currentNode));
-            }
+        // (--- 新逻辑 ---)
+        // 直接从 route.final 读取当前节点
+        cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
+        if (cJSON_IsString(final_outbound) && final_outbound->valuestring) {
+            MultiByteToWideChar(CP_UTF8, 0, final_outbound->valuestring, -1, currentNode, ARRAYSIZE(currentNode));
         }
     }
     cJSON* inbounds = cJSON_GetObjectItem(root, "inbounds");
@@ -475,6 +470,7 @@ BOOL ParseTags() {
     free(buffer);
     return TRUE;
 }
+
 
 int GetHttpInboundPort() {
     return httpPort;
@@ -784,6 +780,9 @@ BOOL IsSystemProxyEnabled() {
     return isEnabled;
 }
 
+// =========================================================================
+// (已修改) 安全地修改 config.json 中的路由 (修改 route.final)
+// =========================================================================
 void SafeReplaceOutbound(const wchar_t* newTag) {
     char* buffer = NULL;
     long size = 0;
@@ -804,25 +803,19 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
         free(newTagMb);
         return;
     }
-    BOOL updated = FALSE;
+
+    // (--- 已修改 ---)
     cJSON* route = cJSON_GetObjectItem(root, "route");
     if (route) {
-        cJSON* rules = cJSON_GetObjectItem(route, "rules");
-        if (cJSON_IsArray(rules) && cJSON_GetArraySize(rules) > 0) {
-            cJSON* first_rule = cJSON_GetArrayItem(rules, 0);
-            if (first_rule) {
-                cJSON* rule_outbound = cJSON_GetObjectItem(first_rule, "outbound");
-                if (rule_outbound) {
-                    cJSON_SetValuestring(rule_outbound, newTagMb);
-                    updated = TRUE;
-                }
-            }
-        }
-        if (!updated) {
-            cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
-            if (final_outbound) {
-                cJSON_SetValuestring(final_outbound, newTagMb);
-            }
+        // (--- 新逻辑 ---)
+        // 直接修改 route.final
+        cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
+        if (final_outbound) {
+            cJSON_SetValuestring(final_outbound, newTagMb);
+        } else {
+            // (--- 备用逻辑 ---)
+            // 如果 "final" 字段不存在，则创建它
+            cJSON_AddItemToObject(route, "final", cJSON_CreateString(newTagMb));
         }
     }
 
@@ -1094,41 +1087,104 @@ void OpenConverterHtmlFromResource() {
     }
 }
 
+// =========================================================================
+// (已修改) 生成默认配置文件 (匹配 route.final 逻辑)
+// =========================================================================
 void CreateDefaultConfig() {
+    // (--- 已修改 ---)
+    // 使用一个更完整、更符合当前路由(route.final)结构的默认配置
     const char* defaultConfig =
         "{\n"
-        "\t\"log\":\t{\n"
-        "\t\t\"level\":\t\"info\"\n" // 保持 info 级别以供日志监控
+        "\t\"log\": {\n"
+        "\t\t\"level\": \"debug\",\n" // 匹配用户配置中的日志级别
+        "\t\t\"disabled\": false\n"
         "\t},\n"
-        "\t\"inbounds\":\t[{\n"
-        "\t\t\t\"type\":\t\"http\",\n"
-        "\t\t\t\"tag\":\t\"http-in\",\n"
-        "\t\t\t\"listen\":\t\"127.0.0.1\",\n"
-        "\t\t\t\"listen_port\":\t10809\n"
-        "\t\t}],\n"
-        "\t\"outbounds\":\t[{\n"
-        "\t\t\t\"type\":\t\"vless\",\n"
-        "\t\t\t\"tag\":\t\"XXX-vless\",\n"
-        "\t\t\t\"server\":\t\"XXX\",\n"
-        "\t\t\t\"server_port\":\t443,\n"
-        "\t\t\t\"uuid\":\t\"XXX-XXXX-XXX-XXX-XXXXX\",\n"
-        "\t\t\t\"tls\":\t{\n"
-        "\t\t\t\t\"enabled\":\ttrue,\n"
-        "\t\t\t\t\"server_name\":\t\"XXX.\"\n"
+        "\t\"dns\": {\n"
+        "\t\t\"servers\": [\n"
+        "\t\t\t{\n"
+        "\t\t\t\t\"tag\": \"dns-direct\",\n"
+        "\t\t\t\t\"address\": \"119.29.29.29\",\n" // 腾讯 DNS
+        "\t\t\t\t\"detour\": \"直接连接\"\n"
         "\t\t\t},\n"
-        "\t\t\t\"transport\":\t{\n"
-        "\t\t\t\t\"type\":\t\"XXX\",\n"
-        "\t\t\t\t\"path\":\t\"XXX\",\n"
-        "\t\t\t\t\"headers\":\t{\n"
-        "\t\t\t\t\t\"Host\":\t\"XXX\"\n"
-        "\t\t\t\t}\n"
+        "\t\t\t{\n"
+        "\t\t\t\t\"tag\": \"dns-proxy\",\n"
+        "\t\t\t\t\"address\": \"https://1.1.1.1/dns-query\",\n" // CF DNS
+        "\t\t\t\t\"detour\": \"自动切换\"\n" // 假设 '自动切换' 是代理
+        "\t\t\t},\n"
+        "\t\t\t{\n"
+        "\t\t\t\t\"tag\": \"dns-block\",\n"
+        "\t\t\t\t\"address\": \"rcode://refused\"\n"
         "\t\t\t}\n"
-        "\t\t}],\n"
-        "\t\"route\":\t{\n"
-        "\t\t\"rules\":\t[{\n"
-        "\t\t\t\t\"inbound\":\t[\"http-in\"],\n"
-        "\t\t\t\t\"outbound\":\t\"XXX-vless\"\n"
-        "\t\t\t}]\n"
+        "\t\t],\n"
+        "\t\t\"rules\": [\n"
+        "\t\t\t{\n"
+        "\t\t\t\t\"domain_suffix\": [\".cn\", \"qq.com\", \"tencent.com\"],\n"
+        "\t\t\t\t\"server\": \"dns-direct\"\n"
+        "\t\t\t}\n"
+        "\t\t],\n"
+        "\t\t\"final\": \"dns-proxy\",\n" // 默认使用代理DNS
+        "\t\t\"strategy\": \"ipv4_only\"\n"
+        "\t},\n"
+        "\t\"inbounds\": [\n"
+        "\t\t{\n"
+        "\t\t\t\"type\": \"http\",\n"
+        "\t\t\t\"tag\": \"http-in\",\n"
+        "\t\t\t\"listen\": \"127.0.0.1\",\n"
+        "\t\t\t\"listen_port\": 10809\n"
+        "\t\t}\n"
+        "\t],\n"
+        "\t\"outbounds\": [\n"
+        "\t\t{\n"
+        "\t\t\t\"tag\": \"直接连接\",\n"
+        "\t\t\t\"type\": \"direct\"\n"
+        "\t\t},\n"
+        "\t\t{\n"
+        "\t\t\t\"tag\": \"阻塞\",\n"
+        "\t\t\t\"type\": \"block\"\n"
+        "\t\t},\n"
+        "\t\t{\n"
+        "\t\t\t\"tag\": \"vless-default\",\n" // 默认的占位节点
+        "\t\t\t\"type\": \"vless\",\n"
+        "\t\t\t\"server\": \"your.server.com\",\n"
+        "\t\t\t\"server_port\": 443,\n"
+        "\t\t\t\"uuid\": \"00000000-0000-0000-0000-000000000000\",\n"
+        "\t\t\t\"tls\": {\n"
+        "\t\t\t\t\"enabled\": true,\n"
+        "\t\t\t\t\"server_name\": \"your.server.com\"\n"
+        "\t\t\t}\n"
+        "\t\t},\n"
+        "\t\t{\n"
+        "\t\t\t\"tag\": \"自动切换\",\n" // 匹配用户配置的 selector
+        "\t\t\t\"type\": \"selector\",\n"
+        "\t\t\t\"outbounds\": [\n"
+        "\t\t\t\t\"vless-default\",\n"
+        "\t\t\t\t\"直接连接\",\n"
+        "\t\t\t\t\"阻塞\"\n"
+        "\t\t\t],\n"
+        "\t\t\t\"default\": \"vless-default\"\n"
+        "\t\t}\n"
+        "\t],\n"
+        "\t\"route\": {\n"
+        "\t\t\"rules\": [\n"
+        "\t\t\t{\n"
+        "\t\t\t\t\"domain_suffix\": [\".cn\", \"qq.com\", \"tencent.com\"],\n"
+        "\t\t\t\t\"outbound\": \"直接连接\"\n"
+        "\t\t\t},\n"
+        "\t\t\t{\n"
+        "\t\t\t\t\"ip_cidr\": [\"119.29.29.29\", \"1.1.1.1\"],\n" // DNS服务器
+        "\t\t\t\t\"outbound\": \"直接连接\"\n"
+        "\t\t\t}\n"
+        "\t\t],\n"
+        "\t\t\"final\": \"自动切换\",\n" // (--- 关键修改 ---) 默认路由指向 '自动切换'
+        "\t\t\"auto_detect_interface\": true,\n"
+        "\t\t\"find_process\": true\n"
+        "\t},\n"
+        "\t\"experimental\": {\n"
+        "\t\t\"clash_api\": {\n"
+        "\t\t\t\"external_controller\": \"127.0.0.1:9090\",\n"
+        "\t\t\t\"external_ui\": \"ui\",\n"
+        "\t\t\t\"default_mode\": \"rule\"\n"
+        "\t\t}\n"
         "\t}\n"
         "}";
 
@@ -1138,12 +1194,13 @@ void CreateDefaultConfig() {
         fclose(f);
         MessageBoxW(NULL,
             L"未找到 config.json，已为您生成默认配置文件。\n\n"
-            L"请在使用前修改 config.json 中的服务器信息。",
+            L"请在使用前修改 config.json 中的 'vless-default' 节点信息。", // (--- 已修改提示 ---)
             L"提示", MB_OK | MB_ICONINFORMATION);
     } else {
         MessageBoxW(NULL, L"无法创建默认的 config.json 文件。", L"错误", MB_OK | MB_ICONERROR);
     }
 }
+
 
 // =========================================================================
 // 节点管理功能实现
@@ -1893,22 +1950,13 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
         const char* newTagMb = newTagJson->valuestring;
 
         if (strcmp(oldTagMb, newTagMb) != 0) {
-            BOOL updated = FALSE;
+            // (--- 已修改 ---)
+            // 确保更新 route.final
             cJSON* route = cJSON_GetObjectItem(root, "route");
             if (route) {
-                cJSON* rules = cJSON_GetObjectItem(route, "rules");
-                if (cJSON_IsArray(rules) && cJSON_GetArraySize(rules) > 0) {
-                    cJSON* rule_outbound = cJSON_GetObjectItem(cJSON_GetArrayItem(rules, 0), "outbound");
-                    if (rule_outbound && strcmp(rule_outbound->valuestring, oldTagMb) == 0) {
-                        cJSON_SetValuestring(rule_outbound, newTagMb);
-                        updated = TRUE;
-                    }
-                }
-                if (!updated) {
-                    cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
-                    if (final_outbound && strcmp(final_outbound->valuestring, oldTagMb) == 0) {
-                        cJSON_SetValuestring(final_outbound, newTagMb);
-                    }
+                cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
+                if (final_outbound && strcmp(final_outbound->valuestring, oldTagMb) == 0) {
+                    cJSON_SetValuestring(final_outbound, newTagMb);
                 }
             }
             MultiByteToWideChar(CP_UTF8, 0, newTagMb, -1, currentNode, ARRAYSIZE(currentNode));
@@ -2321,6 +2369,16 @@ int FixDuplicateTags() {
                     if (isCurrentActiveNode) {
                         cJSON* route = cJSON_GetObjectItem(root, "route");
                         if (route) {
+                            // (--- 已修改 ---)
+                            // 确保更新 route.final
+                            cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
+                            // 检查 'final' 是否指向 *旧的* 标签名
+                            if (final_outbound && strcmp(final_outbound->valuestring, currentActiveTagMb) == 0) {
+                                cJSON_SetValuestring(final_outbound, newTagBuffer); // 设置为 *新的* 标签名
+                            }
+
+                            // (--- 保留旧逻辑以防万一 ---)
+                            // (但也可能需要移除，取决于用户配置的复杂性)
                             BOOL updated = FALSE;
                             cJSON* rules = cJSON_GetObjectItem(route, "rules");
                             if (cJSON_IsArray(rules) && cJSON_GetArraySize(rules) > 0) {
@@ -2332,13 +2390,6 @@ int FixDuplicateTags() {
                                         cJSON_SetValuestring(rule_outbound, newTagBuffer); // 设置为 *新的* 标签名
                                         updated = TRUE;
                                     }
-                                }
-                            }
-                            if (!updated) {
-                                cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
-                                // 检查 'final' 是否指向 *旧的* 标签名
-                                if (final_outbound && strcmp(final_outbound->valuestring, currentActiveTagMb) == 0) {
-                                    cJSON_SetValuestring(final_outbound, newTagBuffer); // 设置为 *新的* 标签名
                                 }
                             }
                         }

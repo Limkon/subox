@@ -341,7 +341,7 @@
             saveButton.disabled = true;
 
             const nodeUrls = nodeInput.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-            const outbounds = [];
+            const parsedNodes = []; // 重命名 outbounds 为 parsedNodes 以避免混淆
             let defaultRouteOutboundTag = '';
 
             nodeUrls.forEach(url => {
@@ -383,11 +383,18 @@
                     if (parsed.up) hysteria2Outbound.up_mbps = parseInt(parsed.up, 10);
                     if (parsed.down) hysteria2Outbound.down_mbps = parseInt(parsed.down, 10);
 
-                    outbounds.push(hysteria2Outbound);
+                    parsedNodes.push(hysteria2Outbound);
                     if (!defaultRouteOutboundTag) defaultRouteOutboundTag = tag;
                 } else if (parsed.type === 'vless') {
                     const tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
-                    const currentVlessTag = `${tag}-vless`;
+                    // 确保标签是唯一的，如果多个节点备注相同
+                    const baseTag = tag;
+                    let count = 1;
+                    while (parsedNodes.some(n => n.tag === tag)) {
+                        tag = `${baseTag}_${count++}`;
+                    }
+                    const currentVlessTag = tag;
+
 
                     let tlsObj = {};
                     if (parsed.params.security === 'reality') {
@@ -410,7 +417,7 @@
                         };
                     }
 
-                    outbounds.push({
+                    parsedNodes.push({
                         type: 'vless',
                         tag: currentVlessTag,
                         server: parsed.server,
@@ -423,7 +430,13 @@
                     if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentVlessTag;
                 } else if (parsed.type === 'trojan') {
                     const tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
-                    const currentTrojanTag = `${tag}-trojan`;
+                    // 确保标签是唯一的
+                    const baseTag = tag;
+                    let count = 1;
+                    while (parsedNodes.some(n => n.tag === tag)) {
+                        tag = `${baseTag}_${count++}`;
+                    }
+                    const currentTrojanTag = tag;
 
                     let tlsObj = {};
                     if (parsed.params.security === 'tls') {
@@ -441,7 +454,7 @@
                         };
                     }
 
-                    outbounds.push({
+                    parsedNodes.push({
                         type: 'trojan',
                         tag: currentTrojanTag,
                         server: parsed.server,
@@ -453,7 +466,13 @@
                     if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentTrojanTag;
                 } else if (parsed.type === 'vmess') {
                     let tag = (parsed.ps || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
-                    const currentVmessTag = `${tag}-vmess`;
+                    // 确保标签是唯一的
+                    const baseTag = tag;
+                    let count = 1;
+                    while (parsedNodes.some(n => n.tag === tag)) {
+                        tag = `${baseTag}_${count++}`;
+                    }
+                    const currentVmessTag = tag;
 
                     let tlsObj = null;
                     if (parsed.tls === 'tls') {
@@ -473,7 +492,7 @@
                         };
                     }
 
-                    outbounds.push({
+                    parsedNodes.push({
                         type: 'vmess',
                         tag: currentVmessTag,
                         server: parsed.server,
@@ -487,33 +506,86 @@
                 }
             });
 
-            if (outbounds.length === 0) {
+            if (parsedNodes.length === 0) {
                 errorMessage.textContent = '没有解析到有效的节点信息。';
                 return;
             }
 
-            if (!defaultRouteOutboundTag && outbounds.length > 0) {
-                defaultRouteOutboundTag = outbounds[0].tag;
+            if (!defaultRouteOutboundTag && parsedNodes.length > 0) {
+                defaultRouteOutboundTag = parsedNodes[0].tag;
             }
 
+            // --- 逻辑修改开始 ---
+            // 匹配 config.json 的结构
+
+            const nodeTags = parsedNodes.map(node => node.tag);
+
             const config = {
-                log: {
-                    level: "info"
+                "log": {
+                    "disabled": false,
+                    "level": "debug"
                 },
-                inbounds: [{
-                    type: "http",
-                    tag: "http-in",
-                    listen: "127.0.0.1",
-                    listen_port: 10809
-                }],
-                outbounds: outbounds,
-                route: {
-                    rules: [{
-                        inbound: ["http-in"],
-                        outbound: defaultRouteOutboundTag
-                    }]
+                "dns": {
+                    "servers": [
+                        { "tag": "dns_resolver-tx", "address": "119.29.29.29", "detour": "out-direct" },
+                        { "tag": "dns-direct-tx", "address": "https://doh.pub/dns-query", "address_resolver": "dns_resolver-tx", "detour": "out-direct" },
+                        { "tag": "dns-proxy-cf", "address": "https://cloudflare-dns.com/dns-query", "address_resolver": "dns_resolver-tx", "detour": "out-proxy" },
+                        { "tag": "dns-block", "address": "rcode://refused" }
+                    ],
+                    "rules": [
+                         // 你可以保留 config.json 中的规则，或留空
+                    ],
+                    "strategy": "ipv4_only",
+                    "final": "dns-proxy-cf"
+                },
+                "inbounds": [
+                    {
+                        "tag": "http-in",
+                        "type": "http",
+                        "listen": "127.0.0.1",
+                        "listen_port": 10809
+                    }
+                ],
+                "outbounds": [
+                    {
+                        "tag": "out-direct",
+                        "type": "direct"
+                    },
+                    {
+                        "tag": "out-block",
+                        "type": "block"
+                    },
+                    {
+                        "tag": "out-proxy",
+                        "type": "selector",
+                        "outbounds": nodeTags, // 使用所有解析的节点标签
+                        "default": defaultRouteOutboundTag // 默认使用第一个节点
+                    },
+                    ...parsedNodes // 将所有解析的节点对象附加在后面
+                ],
+                "route": {
+                    "rules": [
+                        // 你可以保留 config.json 中的规则，或留空
+                        // 例如：
+                        {
+                            "ip_cidr": ["119.29.29.29", "120.53.53.53"],
+                            "outbound": "out-proxy"
+                        }
+                    ],
+                    "final": "out-proxy", // 默认路由到代理选择器
+                    "auto_detect_interface": true,
+                    "find_process": true
+                },
+                "experimental": {
+                    "clash_api": {
+                        "external_controller": "127.0.0.1:9090",
+                        "external_ui": "ui",
+                        "default_mode": "rule"
+                    }
                 }
             };
+
+            // --- 逻辑修改结束 ---
 
             outputConfig.value = JSON.stringify(config, null, 2);
             saveButton.disabled = false;
