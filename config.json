@@ -1,6 +1,6 @@
 {
 	"log":	{
-		"disabled":	false,
+		"disabled":	true,
 		"level":	"debug"
 	},
 	"dns":	{
@@ -161,12 +161,5 @@
 		"final":	"自动切换",
 		"auto_detect_interface":	true,
 		"find_process":	true
-	},
-	"experimental":	{
-		"clash_api":	{
-			"external_controller":	"127.0.0.1:9090",
-			"external_ui":	"ui",
-			"default_mode":	"rule"
-		}
 	}
 }
