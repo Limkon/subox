@@ -330,6 +330,7 @@
             return null;
         }
 
+        // --- 函数已更新 ---
         function convertNodes() {
             const nodeInput = document.getElementById('nodeInput').value;
             const outputConfig = document.getElementById('outputConfig');
@@ -341,7 +342,7 @@
             saveButton.disabled = true;
 
             const nodeUrls = nodeInput.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-            const parsedNodes = []; // 重命名 outbounds 为 parsedNodes 以避免混淆
+            const parsedNodes = []; // 存储解析后的节点
             let defaultRouteOutboundTag = '';
 
             nodeUrls.forEach(url => {
@@ -352,10 +353,18 @@
                 }
 
                 if (parsed.type === 'hysteria2') {
-                    const tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    // --- 逻辑更新：添加 hysteria2 的 tag 唯一性检查 ---
+                    let tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    const baseTag = tag;
+                    let count = 1;
+                    while (parsedNodes.some(n => n.tag === tag)) {
+                        tag = `${baseTag}_${count++}`;
+                    }
+                    // --- 逻辑更新结束 ---
+
                     const hysteria2Outbound = {
                         type: 'hysteria2',
-                        tag: tag,
+                        tag: tag, // 使用确保唯一的 tag
                         server: parsed.server,
                         server_port: parsed.port,
                         password: parsed.password
@@ -386,7 +395,7 @@
                     parsedNodes.push(hysteria2Outbound);
                     if (!defaultRouteOutboundTag) defaultRouteOutboundTag = tag;
                 } else if (parsed.type === 'vless') {
-                    const tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    let tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                     // 确保标签是唯一的，如果多个节点备注相同
                     const baseTag = tag;
                     let count = 1;
@@ -429,7 +438,7 @@
                     });
                     if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentVlessTag;
                 } else if (parsed.type === 'trojan') {
-                    const tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    let tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                     // 确保标签是唯一的
                     const baseTag = tag;
                     let count = 1;
@@ -515,25 +524,30 @@
                 defaultRouteOutboundTag = parsedNodes[0].tag;
             }
 
-            // --- 逻辑修改开始 ---
-            // 匹配 config.json 的结构
+            // --- 匹配 config.json (中文标签) 的结构 ---
 
             const nodeTags = parsedNodes.map(node => node.tag);
+            // 将功能性标签也加入到 selector
+            const allSelectorTags = [ ...nodeTags, "直接连接", "阻塞"];
 
             const config = {
                 "log": {
-                    "disabled": false,
+                    "disabled": false, // 保持 false 以便调试，可改为 true
                     "level": "debug"
                 },
                 "dns": {
                     "servers": [
-                        { "tag": "dns_resolver-tx", "address": "119.29.29.29", "detour": "out-direct" },
-                        { "tag": "dns-direct-tx", "address": "https://doh.pub/dns-query", "address_resolver": "dns_resolver-tx", "detour": "out-direct" },
-                        { "tag": "dns-proxy-cf", "address": "https://cloudflare-dns.com/dns-query", "address_resolver": "dns_resolver-tx", "detour": "out-proxy" },
+                        { "tag": "dns_resolver-tx", "address": "119.29.29.29", "detour": "直接连接" },
+                        { "tag": "dns-direct-tx", "address": "https://doh.pub/dns-query", "address_resolver": "dns_resolver-tx", "detour": "直接连接" },
+                        { "tag": "dns-proxy-cf", "address": "https://cloudflare-dns.com/dns-query", "address_resolver": "dns_resolver-tx", "detour": "自动切换" },
                         { "tag": "dns-block", "address": "rcode://refused" }
                     ],
                     "rules": [
-                         // 你可以保留 config.json 中的规则，或留空
+                         // 示例规则，可自行添加
+                        {
+                            "domain_suffix": ["visa.com.tw", "visa.com.sg", "visa.com", "abrdns.com"],
+                            "server": "dns-direct-tx"
+                        }
                     ],
                     "strategy": "ipv4_only",
                     "final": "dns-proxy-cf"
@@ -548,31 +562,30 @@
                 ],
                 "outbounds": [
                     {
-                        "tag": "out-direct",
+                        "tag": "自动切换", // 中文 tag
+                        "type": "selector",
+                        "outbounds": allSelectorTags, // 使用所有解析的节点标签 + 功能标签
+                        "default": defaultRouteOutboundTag // 默认使用第一个节点
+                    },
+                    {
+                        "tag": "直接连接", // 中文 tag
                         "type": "direct"
                     },
                     {
-                        "tag": "out-block",
+                        "tag": "阻塞", // 中文 tag
                         "type": "block"
-                    },
-                    {
-                        "tag": "out-proxy",
-                        "type": "selector",
-                        "outbounds": nodeTags, // 使用所有解析的节点标签
-                        "default": defaultRouteOutboundTag // 默认使用第一个节点
                     },
                     ...parsedNodes // 将所有解析的节点对象附加在后面
                 ],
                 "route": {
                     "rules": [
-                        // 你可以保留 config.json 中的规则，或留空
-                        // 例如：
+                        // 示例规则
                         {
                             "ip_cidr": ["119.29.29.29", "120.53.53.53"],
-                            "outbound": "out-proxy"
+                            "outbound": "直接连接"
                         }
                     ],
-                    "final": "out-proxy", // 默认路由到代理选择器
+                    "final": "自动切换", // 默认路由到代理选择器
                     "auto_detect_interface": true,
                     "find_process": true
                 },
@@ -584,8 +597,7 @@
                     }
                 }
             };
-
-            // --- 逻辑修改结束 ---
+            // --- 结构匹配结束 ---
 
             outputConfig.value = JSON.stringify(config, null, 2);
             saveButton.disabled = false;
@@ -616,6 +628,11 @@
                 const type = outbound.type;
                 let url = '';
 
+                // 只转换节点，跳过 selector, direct, block
+                if (type === 'selector' || type === 'direct' || type === 'block') {
+                    return; 
+                }
+
                 if (type === 'hysteria2') {
                     let paramsStr = '';
                     if (outbound.tls) {
@@ -632,7 +649,7 @@
                     if (outbound.down_mbps) paramsStr += `down=${outbound.down_mbps}&`;
 
                     paramsStr = paramsStr.slice(0, -1); // Remove trailing &
-                    url = `hysteria2://${outbound.password}@${outbound.server}:${outbound.server_port}${paramsStr ? '?' + paramsStr : ''}#${outbound.tag}`;
+                    url = `hysteria2://${outbound.password}@${outbound.server}:${outbound.server_port}${paramsStr ? '?' + paramsStr : ''}#${encodeURIComponent(outbound.tag)}`;
                 } else if (type === 'vless') {
                     let paramsStr = '';
                     if (outbound.flow) paramsStr += `flow=${outbound.flow}&`;
@@ -674,10 +691,10 @@
                     if (transType !== 'tcp') paramsStr += `type=${transType}&`;
                     if (headerType !== 'none') paramsStr += `headerType=${headerType}&`;
                     if (path !== '/') paramsStr += `path=${encodeURIComponent(path)}&`;
-                    if (host !== outbound.server) paramsStr += `host=${encodeURIComponent(host)}&`;
+                    if (host !== outbound.server && host) paramsStr += `host=${encodeURIComponent(host)}&`;
 
                     paramsStr = paramsStr.slice(0, -1); // Remove trailing &
-                    url = `vless://${outbound.uuid}@${outbound.server}:${outbound.server_port}?${paramsStr}#${outbound.tag}`;
+                    url = `vless://${outbound.uuid}@${outbound.server}:${outbound.server_port}?${paramsStr}#${encodeURIComponent(outbound.tag)}`;
                 } else if (type === 'trojan') {
                     let paramsStr = '';
                     let security = 'none';
@@ -702,14 +719,14 @@
                     if (transType !== 'tcp') paramsStr += `type=${transType}&`;
                     if (headerType !== 'none') paramsStr += `headerType=${headerType}&`;
                     if (path !== '/') paramsStr += `path=${encodeURIComponent(path)}&`;
-                    if (host !== outbound.server) paramsStr += `host=${encodeURIComponent(host)}&`;
+                    if (host !== outbound.server && host) paramsStr += `host=${encodeURIComponent(host)}&`;
 
                     paramsStr = paramsStr.slice(0, -1);
-                    url = `trojan://${outbound.password}@${outbound.server}:${outbound.server_port}?${paramsStr}#${outbound.tag}`;
+                    url = `trojan://${outbound.password}@${outbound.server}:${outbound.server_port}?${paramsStr}#${encodeURIComponent(outbound.tag)}`;
                 } else if (type === 'vmess') {
                     const vmessObj = {
                         v: '2',
-                        ps: outbound.tag.replace('-vmess', ''),
+                        ps: outbound.tag.replace(/-vmess$/, ''), // 移除可能的-vmess后缀
                         add: outbound.server,
                         port: outbound.server_port.toString(),
                         id: outbound.uuid,
@@ -732,7 +749,7 @@
             });
 
             if (nodeUrls.length === 0) {
-                errorMessage.textContent = '没有找到有效的 outbounds 来反向转换。';
+                errorMessage.textContent = '没有找到有效的 outbounds 节点来反向转换。';
                 return;
             }
 
