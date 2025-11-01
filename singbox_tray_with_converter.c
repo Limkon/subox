@@ -334,7 +334,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     static HWND hHotkey, hLabel, hOkBtn, hCancelBtn;
     switch (msg) {
         case WM_CREATE: {
-            hLabel = CreateWindowW(L"STATIC", L"请按下快捷键:", WS_CHILD | WS_VISIBLE, 20, 20, 150, 20, hWnd, NULL, NULL, NULL);
+            hLabel = CreateWindowW(L"STATIC", L"显示/隐藏托盘图标快捷键:", WS_CHILD | WS_VISIBLE, 20, 20, 150, 20, hWnd, NULL, NULL, NULL);
             hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD | WS_VISIBLE | WS_BORDER, 20, 45, 240, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL, NULL);
             SendMessageW(hHotkey, HKM_SETHOTKEY, MAKEWORD(g_hotkeyVk, ModToHotkeyf(g_hotkeyModifiers)), 0);
             hOkBtn = CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 60, 85, 80, 25, hWnd, (HMENU)IDOK, NULL, NULL);
@@ -391,7 +391,7 @@ void OpenSettingsWindow() {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     if (!GetClassInfoW(wc.hInstance, SETTINGS_CLASS_NAME, &wc)) { RegisterClassW(&wc); }
-    HWND hSettingsWnd = CreateWindowExW(WS_EX_DLGMODALFRAME, SETTINGS_CLASS_NAME, L"设置快捷键", WS_CAPTION | WS_SYSMENU | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 300, 160, hwnd, NULL, wc.hInstance, NULL);
+    HWND hSettingsWnd = CreateWindowExW(WS_EX_DLGMODALFRAME, SETTINGS_CLASS_NAME, L"隐藏图标", WS_CAPTION | WS_SYSMENU | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 300, 160, hwnd, NULL, wc.hInstance, NULL);
     if (hSettingsWnd) {
         EnableWindow(hwnd, FALSE);
         RECT rc, rcOwner;
@@ -854,7 +854,7 @@ void UpdateMenu() {
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_AUTORUN, L"开机启动");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SYSTEM_PROXY, L"系统代理");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"设置快捷键");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"隐藏图标");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"显示日志"); // 新增
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
@@ -2869,3 +2869,4 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     return (int)msg.wParam;
 
 }
+
