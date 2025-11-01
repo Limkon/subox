@@ -37,118 +37,16 @@
 			"listen_port":	10809
 		}],
 	"outbounds":	[{
+			"tag":	"自动切换",
+			"type":	"selector",
+			"outbounds":	["直接连接", "阻塞"],
+			"default":	"vless-usa"
+		}, {
 			"tag":	"直接连接",
 			"type":	"direct"
 		}, {
 			"tag":	"阻塞",
 			"type":	"block"
-		}, {
-			"tag":	"自动切换",
-			"type":	"selector",
-			"outbounds":	["vless-tw", "vless-sg", "vless-usa", "trojan-tw", "trojan-sg", "trojan-usa", "直接连接", "阻塞"],
-			"default":	"vless-usa"
-		}, {
-			"tag":	"vless-tw",
-			"type":	"vless",
-			"server":	"www.visa.com.tw",
-			"server_port":	443,
-			"uuid":	"214c86b5-cdab-4be7-9767-4828e8b2d871",
-			"tls":	{
-				"enabled":	true,
-				"server_name":	"www.mvp.abrdns.com"
-			},
-			"transport":	{
-				"type":	"ws",
-				"path":	"/?ed=2560",
-				"headers":	{
-					"Host":	"www.mvp.abrdns.com"
-				}
-			}
-		}, {
-			"tag":	"vless-sg",
-			"type":	"vless",
-			"server":	"www.visa.com.sg",
-			"server_port":	443,
-			"uuid":	"214c86b5-cdab-4be7-9767-4828e8b2d871",
-			"tls":	{
-				"enabled":	true,
-				"server_name":	"www.mvp.abrdns.com"
-			},
-			"transport":	{
-				"type":	"ws",
-				"path":	"/?ed=2560",
-				"headers":	{
-					"Host":	"www.mvp.abrdns.com"
-				}
-			}
-		}, {
-			"tag":	"vless-usa",
-			"type":	"vless",
-			"server":	"usa.visa.com",
-			"server_port":	443,
-			"uuid":	"214c86b5-cdab-4be7-9767-4828e8b2d871",
-			"tls":	{
-				"enabled":	true,
-				"server_name":	"www.mvp.abrdns.com"
-			},
-			"transport":	{
-				"type":	"ws",
-				"path":	"/?ed=2560",
-				"headers":	{
-					"Host":	"www.mvp.abrdns.com"
-				}
-			}
-		}, {
-			"tag":	"trojan-tw",
-			"type":	"trojan",
-			"server":	"www.visa.com.tw",
-			"server_port":	443,
-			"password":	"214c86b5-cdab-4be7-9767-4828e8b2d871",
-			"tls":	{
-				"enabled":	true,
-				"server_name":	"www.mvp.abrdns.com"
-			},
-			"transport":	{
-				"type":	"ws",
-				"path":	"/?ed=2560",
-				"headers":	{
-					"Host":	"www.mvp.abrdns.com"
-				}
-			}
-		}, {
-			"tag":	"trojan-sg",
-			"type":	"trojan",
-			"server":	"www.visa.com.sg",
-			"server_port":	443,
-			"password":	"214c86b5-cdab-4be7-9767-4828e8b2d871",
-			"tls":	{
-				"enabled":	true,
-				"server_name":	"www.mvp.abrdns.com"
-			},
-			"transport":	{
-				"type":	"ws",
-				"path":	"/?ed=2560",
-				"headers":	{
-					"Host":	"www.mvp.abrdns.com"
-				}
-			}
-		}, {
-			"tag":	"trojan-usa",
-			"type":	"trojan",
-			"server":	"usa.visa.com",
-			"server_port":	443,
-			"password":	"214c86b5-cdab-4be7-9767-4828e8b2d871",
-			"tls":	{
-				"enabled":	true,
-				"server_name":	"www.mvp.abrdns.com"
-			},
-			"transport":	{
-				"type":	"ws",
-				"path":	"/?ed=2560",
-				"headers":	{
-					"Host":	"www.mvp.abrdns.com"
-				}
-			}
 		}],
 	"route":	{
 		"rules":	[{
