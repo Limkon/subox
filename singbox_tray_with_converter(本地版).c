@@ -2867,4 +2867,5 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     
     if (g_hFont) DeleteObject(g_hFont);
     return (int)msg.wParam;
+
 }
