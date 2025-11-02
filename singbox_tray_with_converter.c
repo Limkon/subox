@@ -2,14 +2,15 @@
  * * Refactored version with:
  * 1. Process Crash Monitoring (MonitorThread)
  * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
- * 3. (NEW) Automatic Node Switching on connection errors (timeout, refused)
- * 4. Auto-Switch Cooldown (60s)
+ * 3. (REMOVED) Automatic Node Switching on connection errors
+ * 4. Auto-Switch Cooldown (60s) -> (Now Error Notify Cooldown)
  * 5. Robust log buffer parsing
  * 6. (NEW) Log Viewer Window to display live sing-box output
  * 7. (NEW) Auto-fix duplicate tags on startup (silently)
  *
  * (Modification): Node switching now targets 'route.final'
  * (Modification): Add/Delete/Update nodes now syncs with '自动切换' selector
+ * (Modification): Hide tray icon = Hide bubble tips
  */
 
 #define UNICODE
@@ -50,7 +51,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 
 #define WM_TRAY (WM_USER + 1)
 #define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
-#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求自动切换
+#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求提示 (不再切换)
 #define WM_LOG_UPDATE (WM_USER + 4)          // 消息：日志线程发送新的日志文本
 
 #define ID_TRAY_EXIT 1001
@@ -191,6 +192,13 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 
 // 辅助函数
 void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
+    // (--- 新增修改 ---)
+    // 如果托盘图标当前是隐藏状态，则不显示任何气泡提示
+    if (!g_isIconVisible) {
+        return;
+    }
+    // (--- 修改结束 ---)
+
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_INFO;
     wcsncpy(nid.szInfoTitle, title, ARRAYSIZE(nid.szInfoTitle) - 1);
@@ -200,6 +208,7 @@ void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
 }
+
 
 void ShowError(const wchar_t* title, const wchar_t* message) {
     DWORD errorCode = GetLastError();
@@ -551,15 +560,16 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
         // 查找可能需要重启的严重错误
         char* fatal_pos = strstr(lineBuf, "level\"=\"fatal");
         char* dial_pos = strstr(lineBuf, "failed to dial");
-        // 新增：检测 timeout 和 connection refused
-        char* timeout_pos = strstr(lineBuf, "timeout"); 
-        char* refused_pos = strstr(lineBuf, "connection refused");
+        // (--- 已移除 ---) 移除 timeout 和 connection refused 检测
+        // char* timeout_pos = strstr(lineBuf, "timeout"); 
+        // char* refused_pos = strstr(lineBuf, "connection refused");
 
-        if (fatal_pos != NULL || dial_pos != NULL || timeout_pos != NULL || refused_pos != NULL) {
+        // (--- 已修改 ---) 仅检测 fatal 和 dial 错误
+        if (fatal_pos != NULL || dial_pos != NULL) {
             time_t now = time(NULL);
             if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
                 lastLogTriggeredRestart = now;
-                // 发送重启消息 (现在将触发节点切换)
+                // 发送消息 (WndProc 将处理此消息以进行提示)
                 PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 0, 0);
             }
             // 处理完错误后，清空缓冲区，防止重复触发
@@ -862,7 +872,7 @@ void UpdateMenu() {
 // --- 重构结束 ---
 
 
-// --- 重构：修改 WndProc (增加自动切换节点) ---
+// --- 重构：修改 WndProc (移除自动切换节点) ---
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // 自动重启的冷却计时器
     static time_t lastAutoRestart = 0;
@@ -919,66 +929,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleTrayIconVisibility();
         }
     }
-    // --- 重构：处理核心崩溃或日志错误 (新增自动切换) ---
+    // --- 重构：处理核心崩溃或日志错误 (移除自动切换) ---
     else if (msg == WM_SINGBOX_CRASHED) {
         // 核心崩溃，只提示，不自动操作
         ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止。请手动检查。");
     }
     else if (msg == WM_SINGBOX_RECONNECT) {
-        // 日志检测到错误（如 timeout），执行自动切换节点
+        // (--- 已修改 ---) 
+        // 日志检测到错误 (fatal, dial failed)，不再执行自动切换，只进行提示。
         
-        // 自动切换的冷却计时器
-        static time_t lastAutoSwitch = 0;
-        const time_t SWITCH_COOLDOWN = 60; // 60秒冷却，防止频繁切换
+        // 冷却计时器 (用于提示，防止刷屏)
+        static time_t lastErrorNotify = 0; 
+        const time_t NOTIFY_COOLDOWN = 60; // 60秒冷却
         time_t now = time(NULL);
 
-        // 检查是否在冷却时间内
-        if (now - lastAutoSwitch > SWITCH_COOLDOWN) {
-            lastAutoSwitch = now; // 更新切换时间戳
-
-            // 1. 重新解析以获取最新的节点列表
-            ParseTags(); 
-            if (nodeCount <= 1) {
-                 // 只有一个或没有节点，无需切换
-                 ShowTrayTip(L"自动切换", L"检测到连接错误，但无其他节点可切换。");
-                 return DefWindowProcW(hWnd, msg, wParam, lParam);
-            }
-
-            // 2. 找到当前节点的索引
-            int currentIndex = -1;
-            for (int i = 0; i < nodeCount; i++) {
-                if (wcscmp(nodeTags[i], currentNode) == 0) {
-                    currentIndex = i;
-                    break;
-                }
-            }
-
-            // 3. 计算下一个节点的索引（顺序循环切换）
-            int nextIndex;
-            if (currentIndex == -1 || (currentIndex + 1) >= nodeCount) {
-                nextIndex = 0; // 如果找不到当前节点或已是最后一个，则切换到第一个
-            } else {
-                nextIndex = currentIndex + 1; // 切换到下一个
-            }
-            
-            const wchar_t* nextNodeTag = nodeTags[nextIndex];
-
-            // 4. 避免切换到自己（当只有一个节点时）
-            if (wcscmp(currentNode, nextNodeTag) == 0) {
-                 ShowTrayTip(L"自动切换", L"检测到连接错误，但无其他节点可切换。");
-                 return DefWindowProcW(hWnd, msg, wParam, lParam);
-            }
-
-            // 5. 执行切换
-            wchar_t message[256];
-            wsprintfW(message, L"检测到连接错误，自动切换到: %s", nextNodeTag);
-            ShowTrayTip(L"自动切换节点", message);
-
-            // 调用现有的切换函数
-            SwitchNode(nextNodeTag);
-
+        if (now - lastErrorNotify > NOTIFY_COOLDOWN) {
+            lastErrorNotify = now; // 更新提示时间戳
+            ShowTrayTip(L"Sing-box 监控", L"检测到核心日志严重错误 (fatal 或 dial failed)。");
         }
-        // 如果在冷却时间内，则不执行任何操作
+        // (--- 移除所有切换逻辑 ---)
     }
     // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -2869,4 +2838,3 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     return (int)msg.wParam;
 
 }
-
