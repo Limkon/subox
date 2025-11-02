@@ -11,6 +11,7 @@
  * (Modification): Node switching now targets 'route.final'
  * (Modification): Add/Delete/Update nodes now syncs with '自动切换' selector
  * (Modification): Hide tray icon = Hide bubble tips
+ * (Modification): Log viewer window correctly receives logs when hidden
  */
 
 #define UNICODE
@@ -2608,16 +2609,18 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
         }
 
         case WM_CLOSE: {
+            // (--- 修改 ---)
             // 用户点击关闭时，只隐藏窗口，不销毁
-            // 这样下次打开时，日志历史还在
+            // 不要设置 hLogViewerWnd = NULL，这样后台可以继续接收日志
             ShowWindow(hWnd, SW_HIDE);
-            hLogViewerWnd = NULL; // 标记为“已关闭”
+            // hLogViewerWnd = NULL; // <-- 移除这一行
             break;
         }
 
         case WM_DESTROY: {
+            // (--- 修改 ---)
             // 窗口被真正销毁时（例如程序退出时）
-            hLogViewerWnd = NULL;
+            hLogViewerWnd = NULL; // <-- hLogViewerWnd = NULL; 应该在这里
             break;
         }
 
