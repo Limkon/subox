@@ -1,17 +1,24 @@
 /* * singbox_tray_with_converter.c
- * * Refactored version with:
+ * * (Refactored Hybrid Version)
  * 1. Process Crash Monitoring (MonitorThread)
  * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
- * 3. (REMOVED) Automatic Node Switching on connection errors
- * 4. Auto-Switch Cooldown (60s) -> (Now Error Notify Cooldown)
- * 5. Robust log buffer parsing
- * 6. (NEW) Log Viewer Window to display live sing-box output
- * 7. (NEW) Auto-fix duplicate tags on startup (silently)
+ * 3. Log Viewer Window to display live sing-box output
+ * 4. Auto-fix duplicate tags on startup (silently)
+ * 5. Full Node Management (Add, Delete, Modify, Pin, Sort, Deduplicate)
+ * 6. Node Converter (from HTML resource)
+ * 7. (NEW) Hybrid Startup Logic:
+ * - If 'set.ini' [Settings] ConfigUrl is EMPTY:
+ * -> Run in LOCAL mode (File 1 logic: CreateDefault, FixDuplicates).
+ * - If 'set.ini' [Settings] ConfigUrl is SET:
+ * -> Run in REMOTE mode (File 2 logic: Download config, fallback to cache).
+ * -> (MODIFIED): If download fails AND no cache exists, fallback to LOCAL mode (CreateDefault).
  *
  * (Modification): Node switching now targets 'route.final'
  * (Modification): Add/Delete/Update nodes now syncs with '自动切换' selector
  * (Modification): Hide tray icon = Hide bubble tips
  * (Modification): Log viewer window correctly receives logs when hidden
+ * (Modification): (--- 已移除 ---) Icon load failure warning.
+ * (Modification): (--- 已修改 ---) Node Management / Converter menus are ALWAYS enabled.
  */
 
 #define UNICODE
@@ -29,7 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-#include <wininet.h>
+#include <wininet.h> // 包含 WinINet 的宏定义
 #include <commctrl.h>
 #include <time.h> // 用于重启冷却
 
@@ -75,8 +82,6 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define ID_NODEMGR_CONTEXT_PIN_NODE 3008
 #define ID_NODEMGR_CONTEXT_DEDUPLICATE 3009
 #define ID_NODEMGR_CONTEXT_SORT_NODES 3010
-// 移除了 ID_NODEMGR_CONTEXT_FIX_DUPLICATE_TAGS
-
 
 // 修改节点对话框控件ID
 #define ID_MODIFY_EDIT_CONTENT 4001
@@ -124,6 +129,8 @@ BOOL g_isIconVisible = TRUE;
 UINT g_hotkeyModifiers = 0;
 UINT g_hotkeyVk = 0;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
+wchar_t g_configUrl[2048] = {0}; // (--- 新增：用于存储配置URL ---)
+
 
 // --- 重构：新增守护功能全局变量 ---
 HANDLE hMonitorThread = NULL;           // 进程崩溃监控线程
@@ -170,6 +177,7 @@ BOOL IsAutorunEnabled();
 void OpenConverterHtmlFromResource();
 char* ConvertLfToCrlf(const char* input);
 void CreateDefaultConfig();
+BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath); // (--- 新增 ---)
 
 // 节点管理函数声明
 void OpenNodeManagerWindow();
@@ -233,11 +241,19 @@ void ShowError(const wchar_t* title, const wchar_t* message) {
 
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     FILE* f = NULL;
-    if (_wfopen_s(&f, filename, L"rb") != 0 || !f) { return FALSE; }
+    if (_wfopen_s(&f, filename, L"rb") != 0 || !f) { 
+        *fileSize = 0; // (--- 修正 ---)
+        return FALSE; 
+    }
     fseek(f, 0, SEEK_END);
     *fileSize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (*fileSize <= 0) { fclose(f); return FALSE; }
+    if (*fileSize <= 0) { 
+        *fileSize = 0; // (--- 修正 ---)
+        *buffer = NULL;
+        fclose(f); 
+        return FALSE; // 文件为空也视为失败
+    }
     *buffer = (char*)malloc(*fileSize + 1);
     if (!*buffer) { fclose(f); return FALSE; }
     fread(*buffer, 1, *fileSize, f);
@@ -298,11 +314,15 @@ char* ConvertLfToCrlf(const char* input) {
     return output;
 }
 
-// 快捷键设置功能函数
+// =========================================================================
+// (--- 已修改：集成 ConfigUrl ---)
+// =========================================================================
 void LoadSettings() {
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", 0, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 0, g_iniFilePath);
     g_isIconVisible = GetPrivateProfileIntW(L"Settings", L"ShowIcon", 1, g_iniFilePath);
+    // (--- 新增：读取URL，默认为空字符串 ---)
+    GetPrivateProfileStringW(L"Settings", L"ConfigUrl", L"", g_configUrl, ARRAYSIZE(g_configUrl), g_iniFilePath);
 }
 
 void SaveSettings() {
@@ -313,7 +333,10 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
     wsprintfW(buffer, L"%d", g_isIconVisible);
     WritePrivateProfileStringW(L"Settings", L"ShowIcon", buffer, g_iniFilePath);
+    // (--- 新增：保存URL ---)
+    WritePrivateProfileStringW(L"Settings", L"ConfigUrl", g_configUrl, g_iniFilePath);
 }
+// =========================================================================
 
 void ToggleTrayIconVisibility() {
     if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); }
@@ -336,7 +359,7 @@ UINT ModToHotkeyf(UINT mods) {
     if (mods & MOD_ALT) flags |= HOTKEYF_ALT;
     if (mods & MOD_CONTROL) flags |= HOTKEYF_CONTROL;
     if (mods & MOD_SHIFT) flags |= HOTKEYF_SHIFT;
-    if (mods & MOD_WIN) flags |= HOTKEYF_EXT;
+    if (mods & MOD_WIN) flags |= MOD_WIN;
     return flags;
 }
 
@@ -344,6 +367,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     static HWND hHotkey, hLabel, hOkBtn, hCancelBtn;
     switch (msg) {
         case WM_CREATE: {
+            // (--- 注意：此窗口未包含 ConfigUrl 编辑功能，用户需手动编辑 set.ini ---)
             hLabel = CreateWindowW(L"STATIC", L"显示/隐藏托盘图标快捷键:", WS_CHILD | WS_VISIBLE, 20, 20, 150, 20, hWnd, NULL, NULL, NULL);
             hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD | WS_VISIBLE | WS_BORDER, 20, 45, 240, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL, NULL);
             SendMessageW(hHotkey, HKM_SETHOTKEY, MAKEWORD(g_hotkeyVk, ModToHotkeyf(g_hotkeyModifiers)), 0);
@@ -561,9 +585,6 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
         // 查找可能需要重启的严重错误
         char* fatal_pos = strstr(lineBuf, "level\"=\"fatal");
         char* dial_pos = strstr(lineBuf, "failed to dial");
-        // (--- 已移除 ---) 移除 timeout 和 connection refused 检测
-        // char* timeout_pos = strstr(lineBuf, "timeout"); 
-        // char* refused_pos = strstr(lineBuf, "connection refused");
 
         // (--- 已修改 ---) 仅检测 fatal 和 dial 错误
         if (fatal_pos != NULL || dial_pos != NULL) {
@@ -846,7 +867,9 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
     free(newTagMb);
 }
 
-// --- 重构：修改 UpdateMenu ---
+// =========================================================================
+// (--- 已修改：移除混合逻辑，菜单项始终可用 ---)
+// =========================================================================
 void UpdateMenu() {
     if (hMenu) DestroyMenu(hMenu);
     if (hNodeSubMenu) DestroyMenu(hNodeSubMenu);
@@ -858,9 +881,13 @@ void UpdateMenu() {
         AppendMenuW(hNodeSubMenu, flags, ID_TRAY_NODE_BASE + i, nodeTags[i]);
     }
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNodeSubMenu, L"切换节点");
+
+    // (--- 已修改：节点管理和转换始终可用 ---)
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MANAGE_NODES, L"管理节点");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_CONVERTER, L"节点转换");
+    // (--- 修改结束 ---)
+    
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_AUTORUN, L"开机启动");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SYSTEM_PROXY, L"系统代理");
@@ -884,7 +911,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         GetCursorPos(&pt);
         SetForegroundWindow(hWnd);
         ParseTags();
-        UpdateMenu();
+        UpdateMenu(); // (--- UpdateMenu 现在始终启用所有菜单 ---)
         CheckMenuItem(hMenu, ID_TRAY_AUTORUN, IsAutorunEnabled() ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, ID_TRAY_SYSTEM_PROXY, IsSystemProxyEnabled() ? MF_CHECKED : MF_UNCHECKED);
         TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hWnd, NULL);
@@ -915,10 +942,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetSystemProxy(!isEnabled);
             ShowTrayTip(L"系统代理", isEnabled ? L"系统代理已关闭" : L"系统代理已开启");
         } else if (id == ID_TRAY_OPEN_CONVERTER) {
+            // (--- 保留文件1的功能 ---)
             OpenConverterHtmlFromResource();
         } else if (id == ID_TRAY_SETTINGS) {
             OpenSettingsWindow();
         } else if (id == ID_TRAY_MANAGE_NODES) {
+             // (--- 保留文件1的功能 ---)
             OpenNodeManagerWindow();
         } else if (id == ID_TRAY_SHOW_CONSOLE) { // --- 新增：处理日志窗口 ---
             OpenLogViewerWindow();
@@ -1170,9 +1199,122 @@ void CreateDefaultConfig() {
     }
 }
 
-
 // =========================================================================
-// 节点管理功能实现
+// (--- 新增：从文件2集成的下载功能 ---)
+// (--- 已修正：使用绝对路径启动 curl.exe ---)
+// =========================================================================
+BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
+    wchar_t cmdLine[4096]; // (--- 缓冲区增大以容纳更长的URL ---)
+    wchar_t fullSavePath[MAX_PATH];
+    wchar_t fullCurlPath[MAX_PATH];
+    wchar_t moduleDir[MAX_PATH];
+
+    // 1. 获取程序 .exe 所在的目录
+    GetModuleFileNameW(NULL, moduleDir, MAX_PATH);
+    wchar_t* p = wcsrchr(moduleDir, L'\\');
+    if (p) {
+        *p = L'\0'; // 截断文件名，只保留目录
+    } else {
+        // 无法获取目录，使用当前目录
+        wcsncpy(moduleDir, L".", MAX_PATH);
+    }
+
+    // 2. 构建 curl.exe 的绝对路径
+    wsprintfW(fullCurlPath, L"%s\\curl.exe", moduleDir);
+
+    // 3. 检查 curl.exe 是否真的存在
+    DWORD fileAttr = GetFileAttributesW(fullCurlPath);
+    if (fileAttr == INVALID_FILE_ATTRIBUTES || (fileAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+         wchar_t errorMsg[MAX_PATH + 256];
+         wsprintfW(errorMsg, L"启动失败：未找到 curl.exe。\n\n"
+                            L"请确保 curl.exe 位于此路径：\n%s",
+                            fullCurlPath);
+         MessageBoxW(NULL, errorMsg, L"文件缺失", MB_OK | MB_ICONERROR);
+        return FALSE;
+    }
+
+    // 4. 获取 config.json 的绝对路径
+    if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
+        ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
+        return FALSE;
+    }
+
+    // 5. 构造 curl.exe 命令
+    // -k 允许不安全的 SSL 连接 (跳过证书验证)
+    // -L 跟随重定向
+    // -sS 静默但显示错误
+    // -o 输出文件
+    wsprintfW(cmdLine, 
+        L"\"%s\" -ksSL -o \"%s\" \"%s\"", // 注意：不再需要 cmd.exe /C
+        fullCurlPath, fullSavePath, url
+    );
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION downloaderPi = {0};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE; // 隐藏 cmd 窗口
+
+    // 6. 直接执行 curl.exe，并将工作目录设置为 .exe 所在目录
+    if (!CreateProcessW(NULL,           // lpApplicationName (use cmdLine)
+                        cmdLine,        // lpCommandLine (必须是可修改的)
+                        NULL,           // lpProcessAttributes
+                        NULL,           // lpThreadAttributes
+                        FALSE,          // bInheritHandles
+                        CREATE_NO_WINDOW, // dwCreationFlags
+                        NULL,           // lpEnvironment
+                        moduleDir,      // lpCurrentDirectory (在 .exe 所在目录运行)
+                        &si,            // lpStartupInfo
+                        &downloaderPi)) // lpProcessInformation
+    {
+        ShowError(L"下载失败", L"无法启动 curl.exe 下载进程 (CreateProcessW)。");
+        return FALSE;
+    }
+
+    // 7. 等待下载进程完成 (最多30秒)
+    DWORD waitResult = WaitForSingleObject(downloaderPi.hProcess, 30000); 
+
+    if (waitResult == WAIT_TIMEOUT) {
+        ShowError(L"下载失败", L"curl.exe 下载超时 (30秒)。");
+        TerminateProcess(downloaderPi.hProcess, 1);
+        CloseHandle(downloaderPi.hProcess);
+        CloseHandle(downloaderPi.hThread);
+        return FALSE;
+    }
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(downloaderPi.hProcess, &exitCode);
+    
+    CloseHandle(downloaderPi.hProcess);
+    CloseHandle(downloaderPi.hThread);
+
+    if (exitCode != 0) {
+        wchar_t errorMsg[512];
+        wsprintfW(errorMsg, L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。", exitCode);
+        ShowError(L"下载失败", errorMsg);
+        return FALSE;
+    }
+
+    // 8. 检查文件是否真的被下载了
+    long fileSize = 0;
+    char* fileBuffer = NULL;
+    if (ReadFileToBuffer(savePath, &fileBuffer, &fileSize)) {
+        if (fileSize < 50) { // 假设一个有效的 JSON 配置至少大于 50 字节
+             ShowError(L"下载失败", L"下载的文件过小 (小于 50 字节)。\n"
+                                   L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。");
+             free(fileBuffer);
+             DeleteFileW(savePath); // (--- 新增 ---) 删除无效的tmp文件
+             return FALSE;
+        }
+        free(fileBuffer);
+        // 文件存在且大小不为0，视为成功
+        return TRUE; 
+    } else {
+        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
+        return FALSE;
+    }
+}
+// =========================================================================
+// 节点管理功能实现 (文件1 保留功能)
 // =========================================================================
 
 // 刷新节点管理窗口中的列表框
@@ -1242,7 +1384,7 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_PIN_NODE, L"置顶节点");
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_SORT_NODES, L"节点排序");
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_DEDUPLICATE, L"节点去重 (内容)");
-                // 移除了 "修复重复标签" 菜单项
+                // 移除了 "修复重复标签" 菜单项 (已改为启动时自动修复)
                 AppendMenuW(hContextMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_SELECT_ALL, L"全部选择");
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_DESELECT_ALL, L"全部取消");
@@ -1295,8 +1437,6 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     break;
                 }
                 
-                // 移除了 ID_NODEMGR_CONTEXT_FIX_DUPLICATE_TAGS 的 case 处理
-
                 case ID_NODEMGR_CONTEXT_SELECT_ALL:
                     SendMessage(hListBox, LB_SETSEL, TRUE, -1);
                     break;
@@ -2478,22 +2618,6 @@ int FixDuplicateTags() {
                             if (final_outbound && strcmp(final_outbound->valuestring, currentActiveTagMb) == 0) {
                                 cJSON_SetValuestring(final_outbound, newTagBuffer); // 设置为 *新的* 标签名
                             }
-
-                            // (--- 保留旧逻辑以防万一 ---)
-                            // (但也可能需要移除，取决于用户配置的复杂性)
-                            BOOL updated = FALSE;
-                            cJSON* rules = cJSON_GetObjectItem(route, "rules");
-                            if (cJSON_IsArray(rules) && cJSON_GetArraySize(rules) > 0) {
-                                cJSON* first_rule = cJSON_GetArrayItem(rules, 0);
-                                if (first_rule) {
-                                    cJSON* rule_outbound = cJSON_GetObjectItem(first_rule, "outbound");
-                                    // 检查路由是否指向 *旧的* 标签名
-                                    if (rule_outbound && strcmp(rule_outbound->valuestring, currentActiveTagMb) == 0) {
-                                        cJSON_SetValuestring(rule_outbound, newTagBuffer); // 设置为 *新的* 标签名
-                                        updated = TRUE;
-                                    }
-                                }
-                            }
                         }
                     }
 
@@ -2683,7 +2807,7 @@ void OpenLogViewerWindow() {
 
 
 // =========================================================================
-// 主函数
+// (--- 已修改：移除图标加载失败弹窗 ---)
 // =========================================================================
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdShow) {
@@ -2732,42 +2856,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         wcsncpy(g_iniFilePath, L"set.ini", MAX_PATH - 1);
     }
 
-    // 检查config.json是否存在，如果不存在则创建
-    DWORD fileAttr = GetFileAttributesW(L"config.json");
-    if (fileAttr == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND) {
-        CreateDefaultConfig();
-    }
-
+    // --- (修改) 启动逻辑 ---
+    
+    // (--- 提前加载设置 ---)
+    // (--- g_configUrl 将在此处被加载 ---)
     LoadSettings();
-    // 第一次加载配置
-    if (!ParseTags()) {
-        MessageBoxW(NULL, L"无法读取或解析 config.json 文件。", L"错误", MB_OK | MB_ICONERROR);
-        if (hMutex) CloseHandle(hMutex);
-        if (g_hFont) DeleteObject(g_hFont);
-        if (hLogFont) DeleteObject(hLogFont); // 退出前清理
-        return 1;
-    }
 
-    // --- 修改：自动检测并修复重复标签 (静默) ---
-    int renamedCount = FixDuplicateTags();
-    if (renamedCount > 0) {
-        // --- 移除了提示框 ---
-        
-        // 必须重新加载配置，因为 FixDuplicateTags 已经修改了 config.json
-        if (!ParseTags()) {
-            MessageBoxW(NULL, L"自动修复后无法重新加载 config.json。", L"错误", MB_OK | MB_ICONERROR);
-            if (hMutex) CloseHandle(hMutex);
-            if (g_hFont) DeleteObject(g_hFont);
-            if (hLogFont) DeleteObject(hLogFont);
-            return 1;
-        }
-    } else if (renamedCount == -1) {
-        // 保留错误提示，因为这可能是文件权限问题
-        MessageBoxW(NULL, L"尝试自动修复重复标签时发生错误。\n请检查 config.json 文件权限。", L"修复错误", MB_OK | MB_ICONWARNING);
-    }
-    // --- 修改结束 ---
-
-
+    // 1. 创建窗口 (此时还未创建托盘图标)
     const wchar_t* CLASS_NAME = L"TrayWindowClass";
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = WndProc;
@@ -2775,7 +2870,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     wc.lpszClassName = CLASS_NAME;
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCE(1));
     if (!wc.hIcon) {
-        MessageBoxW(NULL, L"加载资源图标 (ID: 1) 失败！\n\n请检查：\n1. 资源ID是否为1\n2. 资源类型是否为ICON\n3. .ico文件是否有效且包含16x16尺寸\n\n程序将尝试使用默认图标。", L"资源加载错误", MB_OK | MB_ICONWARNING);
+        // (--- 已移除图标加载失败的提示 ---)
         wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     }
     RegisterClassW(&wc);
@@ -2786,29 +2881,153 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         return 1;
     }
 
+    // 2. 注册热键 (已在 LoadSettings 后)
     if (g_hotkeyVk != 0 || g_hotkeyModifiers != 0) {
         if (!RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, g_hotkeyModifiers, g_hotkeyVk)) {
             MessageBoxW(NULL, L"注册全局快捷键失败！\n可能已被其他程序占用。", L"快捷键错误", MB_OK | MB_ICONWARNING);
         }
     }
 
+    // 3. 准备托盘图标数据
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = wc.hIcon;
-    wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
+    wcsncpy(nid.szTip, L"程序正在启动...", ARRAYSIZE(nid.szTip) - 1);
     nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
+    // 4. (已在 LoadSettings 后) 如果设置可见，则显示托盘
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
+
+    // =========================================================================
+    // (--- 混合启动逻辑开始 ---)
+    // =========================================================================
+
+    const wchar_t* configPath = L"config.json";
+    const wchar_t* tempConfigPath = L"config.json.tmp";
+    BOOL isRemoteMode = (wcslen(g_configUrl) > 0); // (--- 初始模式 ---)
+    
+    // (--- 退出程序的清理宏 ---)
+    #define CLEANUP_AND_EXIT() \
+        do { \
+            if (hMutex) CloseHandle(hMutex); \
+            if (g_hFont) DeleteObject(g_hFont); \
+            if (hLogFont) DeleteObject(hLogFont); \
+            DestroyWindow(hwnd); \
+            PostQuitMessage(1); \
+            return 1; \
+        } while (0)
+
+    if (isRemoteMode) {
+        // --- 模式2：远程配置 (文件2 逻辑) ---
+        
+        // 1. 检查配置地址是否有效 (通过下载到 .tmp 实现)
+        ShowTrayTip(L"请稍候", L"正在检查配置地址有效性...");
+        if (!DownloadConfig(g_configUrl, tempConfigPath)) {
+            // 2. 无效 -> 检查本地是否有缓存
+            DWORD fileAttrCache = GetFileAttributesW(configPath);
+            if (fileAttrCache != INVALID_FILE_ATTRIBUTES && !(fileAttrCache & FILE_ATTRIBUTE_DIRECTORY)) {
+                 // 有缓存，使用缓存启动
+                 ShowTrayTip(L"下载失败", L"使用本地缓存的配置启动...");
+                 // (isRemoteMode 保持 true, g_configUrl 保持 set, 但管理菜单仍将可用)
+            } else {
+                // (--- 修改：下载失败且无缓存 ---)
+                // (--- 回退到本地模式并创建默认配置 ---)
+                ShowTrayTip(L"下载失败", L"无本地缓存，正在创建默认配置...");
+                CreateDefaultConfig();
+                // (--- 启动时不再需要修改 g_configUrl, 因为 UpdateMenu 始终启用菜单 ---)
+                // g_configUrl[0] = L'\0'; 
+                // isRemoteMode = FALSE; 
+                // (--- 修改结束 ---)
+            }
+        } else {
+             // 3. 有效 -> 下载成功 (config.json.tmp 已存在)
+             DWORD fileAttr = GetFileAttributesW(configPath);
+             BOOL configExists = (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY));
+
+             if (configExists) {
+                 // --- 路径: 本地存在，比较大小 ---
+                 long oldSize = 0;
+                 char* oldBuf = NULL;
+                 ReadFileToBuffer(configPath, &oldBuf, &oldSize); 
+                 if (oldBuf) free(oldBuf);
+                 
+                 long newSize = 0;
+                 char* newBuf = NULL;
+                 ReadFileToBuffer(tempConfigPath, &newBuf, &newSize);
+                 if (newBuf) free(newBuf);
+
+                 if (newSize > 0 && abs(newSize - oldSize) > 100) {
+                     // 5. 相差大于100字节 -> 覆盖
+                     ShowTrayTip(L"请稍候", L"检测到新配置，正在应用...");
+                     if (!MoveFileExW(tempConfigPath, configPath, MOVEFILE_REPLACE_EXISTING)) {
+                         ShowError(L"配置更新失败", L"无法覆盖旧的 config.json。");
+                         DeleteFileW(tempConfigPath);
+                     }
+                 } else {
+                     // 6. 相差小于100字节 -> 保留
+                     DeleteFileW(tempConfigPath);
+                 }
+
+             } else {
+                 // --- 路径: 本地不存在 ---
+                 ShowTrayTip(L"请稍候", L"未找到本地配置，正在应用下载的配置...");
+                 if (!MoveFileExW(tempConfigPath, configPath, MOVEFILE_REPLACE_EXISTING)) {
+                      ShowError(L"启动失败", L"无法将下载的配置 (tmp) 重命名为 config.json。");
+                      DeleteFileW(tempConfigPath);
+                      CLEANUP_AND_EXIT();
+                 }
+             }
+             // (isRemoteMode 保持 true, g_configUrl 保持 set, 但管理菜单仍将可用)
+        }
+    } else {
+        // --- 模式1：本地配置 (文件1 逻辑) ---
+        DWORD fileAttr = GetFileAttributesW(configPath);
+        if (fileAttr == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND) {
+            ShowTrayTip(L"请稍候", L"未找到配置，正在生成默认配置...");
+            CreateDefaultConfig();
+        }
+        // (isRemoteMode 保持 false, g_configUrl 保持 empty, 管理菜单将保持启用)
+    }
+
+    // --- (公共逻辑：解析和修复) ---
+    // 第一次加载配置 (本地模式/远程模式下载完毕后)
+    if (!ParseTags()) {
+        MessageBoxW(NULL, L"无法读取或解析 config.json 文件。\n请检查文件是否存在且格式正确。", L"JSON 解析失败", MB_OK | MB_ICONERROR);
+        CLEANUP_AND_EXIT();
+    }
+
+    // (保留) 自动检测并修复重复标签 (静默)
+    // (currentNode 必须在 FixDuplicateTags 之前被 ParseTags 设置)
+    int renamedCount = FixDuplicateTags();
+    if (renamedCount > 0) {
+        // 必须重新加载配置，因为 FixDuplicateTags 已经修改了 config.json
+        if (!ParseTags()) {
+            MessageBoxW(NULL, L"自动修复后无法重新加载 config.json。", L"错误", MB_OK | MB_ICONERROR);
+            CLEANUP_AND_EXIT();
+        }
+    } else if (renamedCount == -1) {
+        // 保留错误提示，因为这可能是文件权限问题
+        MessageBoxW(NULL, L"尝试自动修复重复标签时发生错误。\n请检查 config.json 文件权限。", L"修复错误", MB_OK | MB_ICONWARNING);
+    }
+    
+    // (--- 移除清理宏定义 ---)
+    #undef CLEANUP_AND_EXIT
+    // =========================================================================
+    // (--- 混合启动逻辑结束 ---)
+    // =========================================================================
 
     // 确保启动前 g_isExiting 为 false
     g_isExiting = FALSE;
     StartSingBox();
     
+    wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
+    if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
+
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
         // --- 新增：检查是否是日志窗口的消息 ---
