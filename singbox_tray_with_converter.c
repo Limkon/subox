@@ -1,7 +1,6 @@
 #define UNICODE
 #define _UNICODE
 
-// 必须在包含任何 Windows 头文件之前定义
 #define _WIN32_IE 0x0601
 #define __STDC_WANT_LIB_EXT1__ 1
 #define _WIN32_WINNT 0x0601
@@ -17,7 +16,6 @@
 #include <commctrl.h>
 #include <time.h> // 用于重启冷却
 
-// 直接包含源文件以简化 TCC 编译过程
 #include "cJSON.c"
 
 // 为兼容旧版 SDK (如某些 MinGW 版本) 手动添加缺失的宏定义
@@ -39,6 +37,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求提示 (不再切换)
 #define WM_LOG_UPDATE (WM_USER + 4)          // 消息：日志线程发送新的日志文本
 #define WM_INIT_COMPLETE (WM_USER + 5)       // (--- 新增：初始化线程完成消息 ---)
+#define WM_SHOW_TRAY_TIP (WM_USER + 6)       // (--- 新增：后台线程显示气泡提示 ---)
 
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
@@ -157,7 +156,8 @@ char* ConvertLfToCrlf(const char* input);
 void CreateDefaultConfig();
 BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize); // (--- 新增 ---)
 BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName); // (--- 新增 ---)
-BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath); // (--- 新增 ---)
+BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath); // (--- 修改：增加 hWndMain 参数 ---)
+void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message); // (--- 新增：后台发消息函数 ---)
 
 // 节点管理函数声明
 void OpenNodeManagerWindow();
@@ -180,9 +180,6 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 
 
 // 辅助函数
-// =========================================================================
-// (--- 已修改：使用本地副本显示汽泡，避免修改全局 nid.uFlags ---)
-// =========================================================================
 void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     // (--- 新增修改 ---)
     // 如果托盘图标当前是隐藏状态，则不显示任何气泡提示
@@ -191,24 +188,14 @@ void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     }
     // (--- 修改结束 ---)
 
-    // (--- 关键修复：创建一个本地副本 ---)
-    // 我们只修改副本的 uFlags，不修改全局 nid.uFlags
-    // 这可以防止与 ToggleTrayIconVisibility 发生冲突
-    NOTIFYICONDATAW nid_tip = nid;
-
-    // (--- 已修改：在副本上设置标志 ---)
-    nid_tip.uFlags = NIF_INFO | NIF_GUID;
-    nid_tip.dwInfoFlags = NIIF_INFO;
-    wcsncpy(nid_tip.szInfoTitle, title, ARRAYSIZE(nid_tip.szInfoTitle) - 1);
-    nid_tip.szInfoTitle[ARRAYSIZE(nid_tip.szInfoTitle) - 1] = L'\0';
-    wcsncpy(nid_tip.szInfo, message, ARRAYSIZE(nid_tip.szInfo) - 1);
-    nid_tip.szInfo[ARRAYSIZE(nid_tip.szInfo) - 1] = L'\0';
-    
-    // (--- 已修改：使用副本调用 NIM_MODIFY ---)
-    Shell_NotifyIconW(NIM_MODIFY, &nid_tip);
-    
-    // (--- 已移除：不再需要重置全局 nid.uFlags ---)
-    // nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID; // <-- 已移除
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    wcsncpy(nid.szInfoTitle, title, ARRAYSIZE(nid.szInfoTitle) - 1);
+    nid.szInfoTitle[ARRAYSIZE(nid.szInfoTitle) - 1] = L'\0';
+    wcsncpy(nid.szInfo, message, ARRAYSIZE(nid.szInfo) - 1);
+    nid.szInfo[ARRAYSIZE(nid.szInfo) - 1] = L'\0';
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
 }
 
 
@@ -331,21 +318,9 @@ void SaveSettings() {
 }
 // =========================================================================
 
-// =========================================================================
-// (--- 已修改：在 NIM_ADD 后必须调用 NIM_SETVERSION ---)
-// =========================================================================
 void ToggleTrayIconVisibility() {
-    if (g_isIconVisible) { 
-        Shell_NotifyIconW(NIM_DELETE, &nid); 
-    }
-    else { 
-        Shell_NotifyIconW(NIM_ADD, &nid); 
-        
-        // (--- 关键修复：重新添加图标后，必须重新设置版本 ---)
-        // 否则后续的 Toast 通知会失败
-        nid.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &nid);
-    }
+    if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); }
+    else { Shell_NotifyIconW(NIM_ADD, &nid); }
     g_isIconVisible = !g_isIconVisible;
     SaveSettings();
 }
@@ -1006,6 +981,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             PostMessageW(hWnd, WM_COMMAND, ID_TRAY_EXIT, 0);
         }
     }
+    // (--- 新增：处理后台线程的气泡提示 ---)
+    else if (msg == WM_SHOW_TRAY_TIP) {
+        wchar_t* pTitle = (wchar_t*)wParam;
+        wchar_t* pMessage = (wchar_t*)lParam;
+        if (pTitle && pMessage) {
+            ShowTrayTip(pTitle, pMessage);
+            // 释放由 PostTrayTip 分配的内存
+            free(pTitle);
+            free(pMessage);
+        }
+    }
     // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -1280,8 +1266,44 @@ BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNe
     return FALSE;
 }
 
-BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
-    wchar_t cmdLine[4096]; 
+// =========================================================================
+// (--- 新增：辅助函数，用于后台线程安全地发送气泡提示 ---)
+// =========================================================================
+void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message) {
+    size_t titleLen = wcslen(title) + 1;
+    size_t msgLen = wcslen(message) + 1;
+    wchar_t* pTitle = (wchar_t*)malloc(titleLen * sizeof(wchar_t));
+    wchar_t* pMessage = (wchar_t*)malloc(msgLen * sizeof(wchar_t));
+
+    if (!pTitle || !pMessage) {
+        if (pTitle) free(pTitle);
+        if (pMessage) free(pMessage);
+        return;
+    }
+    
+    // 复制字符串
+    wcsncpy(pTitle, title, titleLen);
+    pTitle[titleLen - 1] = L'\0';
+    wcsncpy(pMessage, message, msgLen);
+    pMessage[msgLen - 1] = L'\0';
+
+    // 异步发送消息，将内存指针作为参数传递
+    // 主窗口的 WndProc (WM_SHOW_TRAY_TIP) 将负责 free() 它们
+    if (!PostMessageW(hWndMain, WM_SHOW_TRAY_TIP, (WPARAM)pTitle, (LPARAM)pMessage)) {
+        // 如果 PostMessage 失败 (例如主窗口已销毁)，我们必须在这里释放内存
+        free(pTitle);
+        free(pMessage);
+    }
+}
+
+
+// =========================================================================
+// (--- 新增：从文件2集成的下载功能 ---)
+// (--- 已修正：使用绝对路径启动 curl.exe ---)
+// (--- 已修改：移除弹窗，改用 PostTrayTip ---)
+// =========================================================================
+BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) { // (--- 修改：增加 hWndMain 参数 ---)
+    wchar_t cmdLine[4096]; // (--- 缓冲区增大以容纳更长的URL ---)
     wchar_t fullSavePath[MAX_PATH];
     wchar_t fullCurlPath[MAX_PATH];
     wchar_t moduleDir[MAX_PATH];
@@ -1290,15 +1312,16 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     GetModuleFileNameW(NULL, moduleDir, MAX_PATH);
     wchar_t* p = wcsrchr(moduleDir, L'\\');
     if (p) {
-        *p = L'\0'; 
+        *p = L'\0'; // 截断文件名，只保留目录
     } else {
+        // 无法获取目录，使用当前目录
         wcsncpy(moduleDir, L".", MAX_PATH);
     }
 
     // 2. 构建 curl.exe 的绝对路径
     wsprintfW(fullCurlPath, L"%s\\curl.exe", moduleDir);
 
-    // 3. 检查 curl.exe 是否真的存在 (--- 这个弹窗保留，因为这是致命的本地错误 ---)
+    // 3. 检查 curl.exe 是否真的存在
     DWORD fileAttr = GetFileAttributesW(fullCurlPath);
     if (fileAttr == INVALID_FILE_ATTRIBUTES || (fileAttr & FILE_ATTRIBUTE_DIRECTORY)) {
          wchar_t errorMsg[MAX_PATH + 256];
@@ -1309,34 +1332,39 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         return FALSE;
     }
 
-    // 4. 获取 savePath 的绝对路径 (--- 这个 ShowError 保留，同上 ---)
+    // 4. 获取 savePath 的绝对路径
+    // (--- 优化：savePath 现在可能是临时路径，GetFullPathName 仍然适用 ---)
     if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
         ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
         return FALSE;
     }
 
     // 5. 构造 curl.exe 命令
+    // -k 允许不安全的 SSL 连接 (跳过证书验证)
+    // -L 跟随重定向
+    // -sS 静默但显示错误
+    // -o 输出文件
     wsprintfW(cmdLine, 
-        L"\"%s\" -ksSL -o \"%s\" \"%s\"", 
+        L"\"%s\" -ksSL -o \"%s\" \"%s\"", // 注意：不再需要 cmd.exe /C
         fullCurlPath, fullSavePath, url
     );
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION downloaderPi = {0};
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE; 
+    si.wShowWindow = SW_HIDE; // 隐藏 cmd 窗口
 
-    // 6. 直接执行 curl.exe (--- 这个 ShowError 保留，同上 ---)
-    if (!CreateProcessW(NULL,           
-                        cmdLine,        
-                        NULL,           
-                        NULL,           
-                        FALSE,          
-                        CREATE_NO_WINDOW, 
-                        NULL,           
-                        moduleDir,      
-                        &si,            
-                        &downloaderPi)) 
+    // 6. 直接执行 curl.exe，并将工作目录设置为 .exe 所在目录
+    if (!CreateProcessW(NULL,           // lpApplicationName (use cmdLine)
+                        cmdLine,        // lpCommandLine (必须是可修改的)
+                        NULL,           // lpProcessAttributes
+                        NULL,           // lpThreadAttributes
+                        FALSE,          // bInheritHandles
+                        CREATE_NO_WINDOW, // dwCreationFlags
+                        NULL,           // lpEnvironment
+                        moduleDir,      // lpCurrentDirectory (在 .exe 所在目录运行)
+                        &si,            // lpStartupInfo
+                        &downloaderPi)) // lpProcessInformation
     {
         ShowError(L"下载失败", L"无法启动 curl.exe 下载进程 (CreateProcessW)。");
         return FALSE;
@@ -1346,8 +1374,8 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     DWORD waitResult = WaitForSingleObject(downloaderPi.hProcess, 30000); 
 
     if (waitResult == WAIT_TIMEOUT) {
-        // (--- 已修改：弹窗改为汽泡通知 ---)
-        ShowTrayTip(L"配置下载失败", L"curl.exe 下载超时 (30秒)。");
+        // (--- 修改：ShowError -> PostTrayTip ---)
+        PostTrayTip(hWndMain, L"下载失败", L"curl.exe 下载超时 (30秒)。");
         TerminateProcess(downloaderPi.hProcess, 1);
         CloseHandle(downloaderPi.hProcess);
         CloseHandle(downloaderPi.hThread);
@@ -1361,11 +1389,10 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     CloseHandle(downloaderPi.hThread);
 
     if (exitCode != 0) {
-        wchar_t errorMsg[128];
-        // (--- 已修改：弹窗改为汽泡通知，并简化消息 ---)
-        // 原始消息: L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。"
-        wsprintfW(errorMsg, L"curl.exe 报告错误 (退出码 %lu)。请检查网络或 URL。", exitCode);
-        ShowTrayTip(L"配置下载失败", errorMsg);
+        wchar_t errorMsg[512];
+        wsprintfW(errorMsg, L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。", exitCode);
+        // (--- 修改：ShowError -> PostTrayTip ---)
+        PostTrayTip(hWndMain, L"下载失败", errorMsg);
         return FALSE;
     }
 
@@ -1375,9 +1402,9 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     // (--- 优化：savePath 现在可能是临时路径，ReadFileToBuffer 仍然适用 ---)
     if (ReadFileToBuffer(savePath, &fileBuffer, &fileSize)) {
         if (fileSize < 50) { // 假设一个有效的 JSON 配置至少大于 50 字节
-             // (--- 已修改：弹窗改为汽泡通知，并简化消息 ---)
-             // 原始消息: L"下载的文件过小 (小于 50 字节)。\n" L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。"
-             ShowTrayTip(L"配置下载失败", L"下载的文件过小(小于50字节)，可能为错误页面。");
+             // (--- 修改：ShowError -> PostTrayTip ---)
+             PostTrayTip(hWndMain, L"下载失败", L"下载的文件过小 (小于 50 字节)。\n"
+                                   L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。");
              free(fileBuffer);
              DeleteFileW(savePath); // (--- 新增 ---) 删除无效的tmp文件
              return FALSE;
@@ -1386,15 +1413,13 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         // 文件存在且大小不为0，视为成功
         return TRUE; 
     } else {
-        // (--- 已修改：弹窗改为汽泡通知 ---)
-        ShowTrayTip(L"配置下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
+        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
         return FALSE;
     }
 }
 // =========================================================================
 // 节点管理功能实现 (文件1 保留功能)
 // =========================================================================
-
 // 刷新节点管理窗口中的列表框
 void RefreshNodeListBox(HWND hListBox) {
     SendMessageW(hListBox, LB_RESETCONTENT, 0, 0);
@@ -2886,6 +2911,7 @@ void OpenLogViewerWindow() {
 
 // =========================================================================
 // (--- 新增：异步初始化工作线程 ---)
+// (--- 已修改：DownloadConfig 调用 ---)
 // =========================================================================
 DWORD WINAPI InitThread(LPVOID lpParam) {
     HWND hWndMain = (HWND)lpParam;
@@ -2921,7 +2947,8 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         
         // (--- 注意：ShowTrayTip 只能在主线程调用，此处不再显示 "正在检查" ---)
         
-        if (!DownloadConfig(g_configUrl, tempConfigPath)) {
+        // (--- 已修改：传入 hWndMain 参数 ---)
+        if (!DownloadConfig(hWndMain, g_configUrl, tempConfigPath)) {
             // 下载失败 -> 检查缓存
             DWORD fileAttrCache = GetFileAttributesW(configPath);
             if (fileAttrCache == INVALID_FILE_ATTRIBUTES || (fileAttrCache & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -3015,7 +3042,6 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
 // =========================================================================
 // (--- 已修改：移除图标加载失败弹窗 ---)
 // (--- 已重构：异步启动 ---)
-// (--- 已修改：添加 NIF_GUID 和 NIM_SETVERSION 以修复 Win10/11 通知 ---)
 // =========================================================================
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdShow) {
@@ -3099,25 +3125,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
     nid.uID = 1;
-    // (--- 已修改：添加 NIF_GUID 标志 ---)
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = wc.hIcon;
-    // (--- 新增：关联 GUID ---)
-    // 我们复用已有的 APP_GUID
-    nid.guidItem = APP_GUID; 
     wcsncpy(nid.szTip, L"程序正在启动...", ARRAYSIZE(nid.szTip) - 1); // (--- 初始提示 ---)
     nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
     // 4. 如果设置可见，则显示托盘
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_ADD, &nid);
-
-        // (--- 新增：设置通知版本以兼容 Win10/11 ---)
-        // 这必须在 NIM_ADD 之后调用
-        // 这将使 NIF_INFO 气泡通知显示为 Toast 通知
-        nid.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &nid);
     }
 
     // =========================================================================
