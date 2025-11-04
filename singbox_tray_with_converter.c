@@ -206,6 +206,9 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 
 
 // 辅助函数
+// =========================================================================
+// (--- 已修改：修改 ShowTrayTip 以始终包含 NIF_GUID ---)
+// =========================================================================
 void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     // (--- 新增修改 ---)
     // 如果托盘图标当前是隐藏状态，则不显示任何气泡提示
@@ -214,14 +217,17 @@ void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     }
     // (--- 修改结束 ---)
 
-    nid.uFlags = NIF_INFO;
+    // (--- 已修改：始终包含 NIF_GUID 标志 ---)
+    nid.uFlags = NIF_INFO | NIF_GUID;
     nid.dwInfoFlags = NIIF_INFO;
     wcsncpy(nid.szInfoTitle, title, ARRAYSIZE(nid.szInfoTitle) - 1);
     nid.szInfoTitle[ARRAYSIZE(nid.szInfoTitle) - 1] = L'\0';
     wcsncpy(nid.szInfo, message, ARRAYSIZE(nid.szInfo) - 1);
     nid.szInfo[ARRAYSIZE(nid.szInfo) - 1] = L'\0';
     Shell_NotifyIconW(NIM_MODIFY, &nid);
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    
+    // (--- 已修改：重置标志时也保留 NIF_GUID ---)
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
 }
 
 
@@ -1280,13 +1286,13 @@ BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNe
     // 4. 其他未知错误
     return FALSE;
 }
-
 // =========================================================================
 // (--- 新增：从文件2集成的下载功能 ---)
 // (--- 已修正：使用绝对路径启动 curl.exe ---)
+// (--- 已修改：将 ShowError 弹窗改为 ShowTrayTip 汽泡通知 ---)
 // =========================================================================
 BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
-    wchar_t cmdLine[4096]; // (--- 缓冲区增大以容纳更长的URL ---)
+    wchar_t cmdLine[4096]; 
     wchar_t fullSavePath[MAX_PATH];
     wchar_t fullCurlPath[MAX_PATH];
     wchar_t moduleDir[MAX_PATH];
@@ -1295,16 +1301,15 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     GetModuleFileNameW(NULL, moduleDir, MAX_PATH);
     wchar_t* p = wcsrchr(moduleDir, L'\\');
     if (p) {
-        *p = L'\0'; // 截断文件名，只保留目录
+        *p = L'\0'; 
     } else {
-        // 无法获取目录，使用当前目录
         wcsncpy(moduleDir, L".", MAX_PATH);
     }
 
     // 2. 构建 curl.exe 的绝对路径
     wsprintfW(fullCurlPath, L"%s\\curl.exe", moduleDir);
 
-    // 3. 检查 curl.exe 是否真的存在
+    // 3. 检查 curl.exe 是否真的存在 (--- 这个弹窗保留，因为这是致命的本地错误 ---)
     DWORD fileAttr = GetFileAttributesW(fullCurlPath);
     if (fileAttr == INVALID_FILE_ATTRIBUTES || (fileAttr & FILE_ATTRIBUTE_DIRECTORY)) {
          wchar_t errorMsg[MAX_PATH + 256];
@@ -1315,39 +1320,34 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         return FALSE;
     }
 
-    // 4. 获取 savePath 的绝对路径
-    // (--- 优化：savePath 现在可能是临时路径，GetFullPathName 仍然适用 ---)
+    // 4. 获取 savePath 的绝对路径 (--- 这个 ShowError 保留，同上 ---)
     if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
         ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
         return FALSE;
     }
 
     // 5. 构造 curl.exe 命令
-    // -k 允许不安全的 SSL 连接 (跳过证书验证)
-    // -L 跟随重定向
-    // -sS 静默但显示错误
-    // -o 输出文件
     wsprintfW(cmdLine, 
-        L"\"%s\" -ksSL -o \"%s\" \"%s\"", // 注意：不再需要 cmd.exe /C
+        L"\"%s\" -ksSL -o \"%s\" \"%s\"", 
         fullCurlPath, fullSavePath, url
     );
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION downloaderPi = {0};
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE; // 隐藏 cmd 窗口
+    si.wShowWindow = SW_HIDE; 
 
-    // 6. 直接执行 curl.exe，并将工作目录设置为 .exe 所在目录
-    if (!CreateProcessW(NULL,           // lpApplicationName (use cmdLine)
-                        cmdLine,        // lpCommandLine (必须是可修改的)
-                        NULL,           // lpProcessAttributes
-                        NULL,           // lpThreadAttributes
-                        FALSE,          // bInheritHandles
-                        CREATE_NO_WINDOW, // dwCreationFlags
-                        NULL,           // lpEnvironment
-                        moduleDir,      // lpCurrentDirectory (在 .exe 所在目录运行)
-                        &si,            // lpStartupInfo
-                        &downloaderPi)) // lpProcessInformation
+    // 6. 直接执行 curl.exe (--- 这个 ShowError 保留，同上 ---)
+    if (!CreateProcessW(NULL,           
+                        cmdLine,        
+                        NULL,           
+                        NULL,           
+                        FALSE,          
+                        CREATE_NO_WINDOW, 
+                        NULL,           
+                        moduleDir,      
+                        &si,            
+                        &downloaderPi)) 
     {
         ShowError(L"下载失败", L"无法启动 curl.exe 下载进程 (CreateProcessW)。");
         return FALSE;
@@ -1357,7 +1357,8 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     DWORD waitResult = WaitForSingleObject(downloaderPi.hProcess, 30000); 
 
     if (waitResult == WAIT_TIMEOUT) {
-        ShowError(L"下载失败", L"curl.exe 下载超时 (30秒)。");
+        // (--- 已修改：弹窗改为汽泡通知 ---)
+        ShowTrayTip(L"配置下载失败", L"curl.exe 下载超时 (30秒)。");
         TerminateProcess(downloaderPi.hProcess, 1);
         CloseHandle(downloaderPi.hProcess);
         CloseHandle(downloaderPi.hThread);
@@ -1371,9 +1372,11 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     CloseHandle(downloaderPi.hThread);
 
     if (exitCode != 0) {
-        wchar_t errorMsg[512];
-        wsprintfW(errorMsg, L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。", exitCode);
-        ShowError(L"下载失败", errorMsg);
+        wchar_t errorMsg[128];
+        // (--- 已修改：弹窗改为汽泡通知，并简化消息 ---)
+        // 原始消息: L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。"
+        wsprintfW(errorMsg, L"curl.exe 报告错误 (退出码 %lu)。请检查网络或 URL。", exitCode);
+        ShowTrayTip(L"配置下载失败", errorMsg);
         return FALSE;
     }
 
@@ -1383,8 +1386,9 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     // (--- 优化：savePath 现在可能是临时路径，ReadFileToBuffer 仍然适用 ---)
     if (ReadFileToBuffer(savePath, &fileBuffer, &fileSize)) {
         if (fileSize < 50) { // 假设一个有效的 JSON 配置至少大于 50 字节
-             ShowError(L"下载失败", L"下载的文件过小 (小于 50 字节)。\n"
-                                   L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。");
+             // (--- 已修改：弹窗改为汽泡通知，并简化消息 ---)
+             // 原始消息: L"下载的文件过小 (小于 50 字节)。\n" L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。"
+             ShowTrayTip(L"配置下载失败", L"下载的文件过小(小于50字节)，可能为错误页面。");
              free(fileBuffer);
              DeleteFileW(savePath); // (--- 新增 ---) 删除无效的tmp文件
              return FALSE;
@@ -1393,7 +1397,8 @@ BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
         // 文件存在且大小不为0，视为成功
         return TRUE; 
     } else {
-        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
+        // (--- 已修改：弹窗改为汽泡通知 ---)
+        ShowTrayTip(L"配置下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
         return FALSE;
     }
 }
@@ -3021,6 +3026,7 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
 // =========================================================================
 // (--- 已修改：移除图标加载失败弹窗 ---)
 // (--- 已重构：异步启动 ---)
+// (--- 已修改：添加 NIF_GUID 和 NIM_SETVERSION 以修复 Win10/11 通知 ---)
 // =========================================================================
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdShow) {
@@ -3104,15 +3110,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
     nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    // (--- 已修改：添加 NIF_GUID 标志 ---)
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = wc.hIcon;
+    // (--- 新增：关联 GUID ---)
+    // 我们复用已有的 APP_GUID
+    nid.guidItem = APP_GUID; 
     wcsncpy(nid.szTip, L"程序正在启动...", ARRAYSIZE(nid.szTip) - 1); // (--- 初始提示 ---)
     nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
     // 4. 如果设置可见，则显示托盘
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_ADD, &nid);
+
+        // (--- 新增：设置通知版本以兼容 Win10/11 ---)
+        // 这必须在 NIM_ADD 之后调用
+        // 这将使 NIF_INFO 气泡通知显示为 Toast 通知
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
     }
 
     // =========================================================================
