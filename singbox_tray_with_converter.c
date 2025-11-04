@@ -2021,7 +2021,7 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hWnd);
             break;
         case WM_DESTROY: {
-             HFONT hFont = (HFONT)SendMessage(GetDlgItem(hWnd, ID_ADD_EDIT_CONTENT), WM_GETFONT, 0, 0);
+        HFONT hFont = (HFONT)SendMessage(GetDlgItem(hWnd, ID_ADD_EDIT_CONTENT), WM_GETFONT, 0, 0);
              if (hFont) DeleteObject(hFont);
              break;
         }
@@ -2062,18 +2062,28 @@ BOOL DeleteNodeByTag(const wchar_t* tagToDelete) {
     // 1. 检查是否为特殊节点 (这些节点不应在 selector 中)
     if (strcmp(tagToDeleteMb, "直接连接") != 0 &&
         strcmp(tagToDeleteMb, "阻塞") != 0 &&
-        strcmp(tagToDeleteMb, "自动切换") != 0)
+        strcmp(tagToDeleteMb, "自动切换") != 0 &&
+        // (--- 补充匹配 config.json ---)
+        strcmp(tagToDeleteMb, "🎯 全球直连") != 0 &&
+        strcmp(tagToDeleteMb, "🚫 断开连接") != 0 &&
+        strcmp(tagToDeleteMb, "🎈 自动选择") != 0 &&
+        strcmp(tagToDeleteMb, "🐟 漏网之鱼") != 0 &&
+        strcmp(tagToDeleteMb, "🌍 GLOBAL") != 0
+        )
     {
-        // 2. 遍历 outbounds 找到 "自动切换" 节点
+        // 2. 遍历 outbounds 找到 "自动切换" (或 "🎈 自动选择") 节点
         cJSON* outbound_iter = NULL;
         cJSON_ArrayForEach(outbound_iter, outbounds) {
             cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
             cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
             
-            if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "自动切换") == 0 &&
-                cJSON_IsString(type_item) && strcmp(type_item->valuestring, "selector") == 0)
+            // (--- 兼容 config.json ---)
+            if (cJSON_IsString(tag_item) && 
+                (strcmp(tag_item->valuestring, "自动切换") == 0 || strcmp(tag_item->valuestring, "🎈 自动选择") == 0) &&
+                cJSON_IsString(type_item) && 
+                (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
             {
-                // 3. 找到了 selector, 遍历其内部的 outbounds 数组
+                // 3. 找到了 selector/urltest, 遍历其内部的 outbounds 数组
                 cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
                 if (cJSON_IsArray(selector_outbounds)) {
                     int i = 0;
@@ -2087,7 +2097,7 @@ BOOL DeleteNodeByTag(const wchar_t* tagToDelete) {
                         i++;
                     }
                 }
-                break; // 假设只有一个 "自动切换" selector
+                // (--- 不 break，因为可能有多个 selector/urltest 引用了它 ---)
             }
         }
     }
@@ -2231,18 +2241,28 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
             // 1. 检查是否为特殊节点
             if (strcmp(oldTagMb, "直接连接") != 0 &&
                 strcmp(oldTagMb, "阻塞") != 0 &&
-                strcmp(oldTagMb, "自动切换") != 0)
+                strcmp(oldTagMb, "自动切换") != 0 &&
+                // (--- 补充匹配 config.json ---)
+                strcmp(oldTagMb, "🎯 全球直连") != 0 &&
+                strcmp(oldTagMb, "🚫 断开连接") != 0 &&
+                strcmp(oldTagMb, "🎈 自动选择") != 0 &&
+                strcmp(oldTagMb, "🐟 漏网之鱼") != 0 &&
+                strcmp(oldTagMb, "🌍 GLOBAL") != 0
+                )
             {
-                // 2. 遍历 outbounds 找到 "自动切换" 节点
+                // 2. 遍历 outbounds 找到 "自动切换" (或 "🎈 自动选择") 节点
                 cJSON* outbound_iter = NULL;
                 cJSON_ArrayForEach(outbound_iter, outbounds) {
                     cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
                     cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
                     
-                    if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "自动切换") == 0 &&
-                        cJSON_IsString(type_item) && strcmp(type_item->valuestring, "selector") == 0)
+                    // (--- 兼容 config.json ---)
+                    if (cJSON_IsString(tag_item) && 
+                        (strcmp(tag_item->valuestring, "自动切换") == 0 || strcmp(tag_item->valuestring, "🎈 自动选择") == 0) &&
+                        cJSON_IsString(type_item) && 
+                        (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
                     {
-                        // 3. 找到了 selector, 遍历其内部的 outbounds 数组
+                        // 3. 找到了 selector/urltest, 遍历其内部的 outbounds 数组
                         cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
                         if (cJSON_IsArray(selector_outbounds)) {
                             cJSON* selector_tag_item = NULL;
@@ -2254,7 +2274,7 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
                                 }
                             }
                         }
-                        break; 
+                        // (--- 不 break ---)
                     }
                 }
             }
@@ -2325,24 +2345,34 @@ BOOL AddNodeToConfig(const char* newNodeContentJson) {
         // 1. 检查是否为特殊节点
         if (strcmp(newTagMb, "直接连接") != 0 &&
             strcmp(newTagMb, "阻塞") != 0 &&
-            strcmp(newTagMb, "自动切换") != 0)
+            strcmp(newTagMb, "自动切换") != 0 &&
+            // (--- 补充匹配 config.json ---)
+            strcmp(newTagMb, "🎯 全球直连") != 0 &&
+            strcmp(newTagMb, "🚫 断开连接") != 0 &&
+            strcmp(newTagMb, "🎈 自动选择") != 0 &&
+            strcmp(newTagMb, "🐟 漏网之鱼") != 0 &&
+            strcmp(newTagMb, "🌍 GLOBAL") != 0
+            )
         {
-            // 2. 遍历 outbounds 找到 "自动切换" 节点
+            // 2. 遍历 outbounds 找到 "自动切换" (或 "🎈 自动选择") 节点
             cJSON* outbound_iter = NULL;
             cJSON_ArrayForEach(outbound_iter, outbounds) {
                 cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
                 cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
                 
-                if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "自动切换") == 0 &&
-                    cJSON_IsString(type_item) && strcmp(type_item->valuestring, "selector") == 0)
+                // (--- 兼容 config.json ---)
+                if (cJSON_IsString(tag_item) && 
+                    (strcmp(tag_item->valuestring, "自动切换") == 0 || strcmp(tag_item->valuestring, "🎈 自动选择") == 0) &&
+                    cJSON_IsString(type_item) && 
+                    (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
                 {
-                    // 3. 找到了 selector, 获取其内部的 outbounds 数组
+                    // 3. 找到了 selector/urltest, 获取其内部的 outbounds 数组
                     cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
                     if (cJSON_IsArray(selector_outbounds)) {
                         // 4. 将新节点的 tag 字符串添加进去
                         cJSON_AddItemToArray(selector_outbounds, cJSON_CreateString(newTagMb));
                     }
-                    break; 
+                    // (--- 不 break ---)
                 }
             }
         }

@@ -330,7 +330,7 @@
             return null;
         }
 
-        // --- 函数已更新 ---
+        // --- 函数已更新 (匹配 config.json 结构) ---
         function convertNodes() {
             const nodeInput = document.getElementById('nodeInput').value;
             const outputConfig = document.getElementById('outputConfig');
@@ -343,7 +343,6 @@
 
             const nodeUrls = nodeInput.split('\n').map(line => line.trim()).filter(line => line.length > 0);
             const parsedNodes = []; // 存储解析后的节点
-            let defaultRouteOutboundTag = '';
 
             nodeUrls.forEach(url => {
                 const parsed = parseUrl(url);
@@ -393,7 +392,6 @@
                     if (parsed.down) hysteria2Outbound.down_mbps = parseInt(parsed.down, 10);
 
                     parsedNodes.push(hysteria2Outbound);
-                    if (!defaultRouteOutboundTag) defaultRouteOutboundTag = tag;
                 } else if (parsed.type === 'vless') {
                     let tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                     // 确保标签是唯一的，如果多个节点备注相同
@@ -436,7 +434,6 @@
                         tls: tlsObj,
                         ...(transportObj ? { transport: transportObj } : {})
                     });
-                    if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentVlessTag;
                 } else if (parsed.type === 'trojan') {
                     let tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                     // 确保标签是唯一的
@@ -472,7 +469,6 @@
                         tls: tlsObj,
                         ...(transportObj ? { transport: transportObj } : {})
                     });
-                    if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentTrojanTag;
                 } else if (parsed.type === 'vmess') {
                     let tag = (parsed.ps || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                     // 确保标签是唯一的
@@ -511,7 +507,6 @@
                         ...(transportObj ? { transport: transportObj } : {}),
                         ...(tlsObj ? { tls: tlsObj } : {})
                     });
-                    if (!defaultRouteOutboundTag) defaultRouteOutboundTag = currentVmessTag;
                 }
             });
 
@@ -520,37 +515,36 @@
                 return;
             }
 
-            if (!defaultRouteOutboundTag && parsedNodes.length > 0) {
-                defaultRouteOutboundTag = parsedNodes[0].tag;
-            }
-
-            // --- 匹配 config.json (中文标签) 的结构 ---
+            // --- 匹配 config.json (新结构) 的结构 ---
 
             const nodeTags = parsedNodes.map(node => node.tag);
-            // 将功能性标签也加入到 selector
-            const allSelectorTags = [ ...nodeTags, "直接连接", "阻塞"];
+            
+            // 定义功能性标签
+            const tagAuto = "🎈 自动选择";
+            const tagDirect = "🎯 全球直连";
+            const tagBlock = "🚫 断开连接";
+            const tagFallback = "🐟 漏网之鱼";
+            const tagGlobal = "🌍 GLOBAL";
+
 
             const config = {
                 "log": {
-                    "disabled": false, // 保持 false 以便调试，可改为 true
-                    "level": "debug"
+                    "disabled": false,
+                    "level": "error" // 级别改为 error
                 },
-                "dns": {
-                    "servers": [
-                        { "tag": "dns_resolver-tx", "address": "119.29.29.29", "detour": "直接连接" },
-                        { "tag": "dns-direct-tx", "address": "https://doh.pub/dns-query", "address_resolver": "dns_resolver-tx", "detour": "直接连接" },
-                        { "tag": "dns-proxy-cf", "address": "https://cloudflare-dns.com/dns-query", "address_resolver": "dns_resolver-tx", "detour": "自动切换" },
-                        { "tag": "dns-block", "address": "rcode://refused" }
-                    ],
-                    "rules": [
-                         // 示例规则，可自行添加
-                        {
-                            "domain_suffix": ["visa.com.tw", "visa.com.sg", "visa.com", "abrdns.com"],
-                            "server": "dns-direct-tx"
-                        }
-                    ],
-                    "strategy": "ipv4_only",
-                    "final": "dns-proxy-cf"
+                "experimental": { // 匹配新结构
+                    "clash_api": {
+                        "external_controller": "127.0.0.1:9090",
+                        "external_ui": "ui",
+                        "default_mode": "rule"
+                    },
+                    "cache_file": { // 添加 cache_file
+                        "enabled": true,
+                        "path": "cache.db",
+                        "store_fakeip": true,
+                        "store_rdrc": true,  // 根据示例 config 添加
+                        "rdrc_timeout": "7d" // 根据示例 config 添加
+                    }
                 },
                 "inbounds": [
                     {
@@ -562,39 +556,123 @@
                 ],
                 "outbounds": [
                     {
-                        "tag": "自动切换", // 中文 tag
+                        "type": "urltest", // 更改为 urltest
+                        "tag": tagAuto,
+                        "url": "https://www.gstatic.com/generate_204",
+                        "interval": "3m",
+                        "tolerance": 150,
+                        "interrupt_exist_connections": true, // 根据示例 config 添加
+                        "outbounds": nodeTags // 仅包含节点 tags
+                    },
+                    {
+                        "type": "direct",
+                        "tag": tagDirect // 更新 tag
+                    },
+                    { // 添加新 selector
                         "type": "selector",
-                        "outbounds": allSelectorTags, // 使用所有解析的节点标签 + 功能标签
-                        "default": defaultRouteOutboundTag // 默认使用第一个节点
+                        "tag": tagFallback,
+                        "interrupt_exist_connections": true, // 根据示例 config 添加
+                        "outbounds": [tagAuto, tagDirect]
+                    },
+                    { // 添加新 selector
+                        "type": "selector",
+                        "tag": tagGlobal,
+                        "interrupt_exist_connections": true, // 根据示例 config 添加
+                        "outbounds": [tagAuto, tagDirect, tagFallback]
                     },
                     {
-                        "tag": "直接连接", // 中文 tag
-                        "type": "direct"
-                    },
-                    {
-                        "tag": "阻塞", // 中文 tag
+                        "tag": tagBlock, // 更新 tag
                         "type": "block"
                     },
                     ...parsedNodes // 将所有解析的节点对象附加在后面
                 ],
                 "route": {
                     "rules": [
-                        // 示例规则
+                        // 更新规则以匹配新配置
+                        {
+                            "domain_suffix": ["doh.pub", "cloudflare-dns.com"],
+                            "outbound": tagDirect
+                        },
                         {
                             "ip_cidr": ["119.29.29.29", "120.53.53.53"],
-                            "outbound": "直接连接"
+                            "outbound": tagDirect
+                        },
+                        { // 根据示例 config 添加 Ads 规则
+                            "action": "reject", 
+                            "rule_set": "Category-Ads"
+                        },
+                        {
+                            "rule_set": ["GeoSite-Private", "GeoIP-Private"],
+                            "outbound": tagDirect
+                        },
+                        {
+                            "rule_set": ["GeoSite-CN", "GeoIP-CN"],
+                            "outbound": tagDirect
                         }
                     ],
-                    "final": "自动切换", // 默认路由到代理选择器
+                    "final": tagAuto, // 默认路由到 urltest
                     "auto_detect_interface": true,
-                    "find_process": true
+                    "find_process": true,
+                    "rule_set": [ // 添加 rule_set 定义
+                        { // 根据示例 config 添加 Ads
+                            "tag": "Category-Ads",
+                            "type": "remote",
+                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs",
+                            "format": "binary",
+                            "download_detour": tagDirect
+                        },
+                        {
+                            "tag": "GeoIP-Private",
+                            "type": "remote",
+                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/private.srs",
+                            "format": "binary",
+                            "download_detour": tagDirect
+                        },
+                        {
+                            "tag": "GeoSite-Private",
+                            "type": "remote",
+                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs",
+                            "format": "binary",
+                            "download_detour": tagDirect
+                        },
+                        {
+                            "tag": "GeoIP-CN",
+                            "type": "remote",
+                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+                            "format": "binary",
+                            "download_detour": tagDirect
+                        },
+                        {
+                            "tag": "GeoSite-CN",
+                            "type": "remote",
+                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+                            "format": "binary",
+                            "download_detour": tagDirect
+                        }
+                    ]
                 },
-                "experimental": {
-                    "clash_api": {
-                        "external_controller": "127.0.0.1:9090",
-                        "external_ui": "ui",
-                        "default_mode": "rule"
-                    }
+                "dns": {
+                    "servers": [
+                        // 更新 detour 标签
+                        { "tag": "dns_resolver-tx", "address": "119.29.29.29", "detour": tagDirect },
+                        { "tag": "dns-direct-tx", "address": "https://doh.pub/dns-query", "address_resolver": "dns_resolver-tx", "detour": tagDirect },
+                        { "tag": "dns-proxy-cf", "address": "https://cloudflare-dns.com/dns-query", "address_resolver": "dns_resolver-tx", "detour": tagAuto },
+                        { "tag": "dns-block", "address": "rcode://refused" }
+                    ],
+                    "rules": [
+                         // 更新规则
+                        {
+                            "domain_suffix": ["visa.com.tw", "visa.com.sg", "visa.com", "abrdns.com", "doh.pub", "cloudflare-dns.com"], // 根据示例 config 添加
+                            "server": "dns-direct-tx"
+                        },
+                        {
+                            "rule_set": "GeoSite-CN",
+                            "server": "dns-direct-tx"
+                        }
+                    ],
+                    "client_subnet": "119.37.192.0", // 添加 client_subnet
+                    "strategy": "ipv4_only",
+                    "final": "dns-proxy-cf"
                 }
             };
             // --- 结构匹配结束 ---
@@ -603,6 +681,7 @@
             saveButton.disabled = false;
         }
 
+        // --- 函数已更新 (匹配 config.json 结构) ---
         function reverseConvert() {
             const configInput = document.getElementById('configInput').value;
             const outputNodes = document.getElementById('outputNodes');
@@ -628,10 +707,12 @@
                 const type = outbound.type;
                 let url = '';
 
-                // 只转换节点，跳过 selector, direct, block
-                if (type === 'selector' || type === 'direct' || type === 'block') {
+                // --- 逻辑修改 ---
+                // 只转换节点，跳过 selector, direct, block, 以及新增的 urltest
+                if (type === 'selector' || type === 'direct' || type === 'block' || type === 'urltest') {
                     return; 
                 }
+                // --- 逻辑修改结束 ---
 
                 if (type === 'hysteria2') {
                     let paramsStr = '';
@@ -690,7 +771,7 @@
                     }
                     if (transType !== 'tcp') paramsStr += `type=${transType}&`;
                     if (headerType !== 'none') paramsStr += `headerType=${headerType}&`;
-                    if (path !== '/') paramsStr += `path=${encodeURIComponent(path)}&`;
+                    if (path !== '/' && path) paramsStr += `path=${encodeURIComponent(path)}&`; // 修正：确保 path 存在
                     if (host !== outbound.server && host) paramsStr += `host=${encodeURIComponent(host)}&`;
 
                     paramsStr = paramsStr.slice(0, -1); // Remove trailing &
@@ -718,7 +799,7 @@
                     }
                     if (transType !== 'tcp') paramsStr += `type=${transType}&`;
                     if (headerType !== 'none') paramsStr += `headerType=${headerType}&`;
-                    if (path !== '/') paramsStr += `path=${encodeURIComponent(path)}&`;
+                    if (path !== '/' && path) paramsStr += `path=${encodeURIComponent(path)}&`; // 修正：确保 path 存在
                     if (host !== outbound.server && host) paramsStr += `host=${encodeURIComponent(host)}&`;
 
                     paramsStr = paramsStr.slice(0, -1);
@@ -726,7 +807,7 @@
                 } else if (type === 'vmess') {
                     const vmessObj = {
                         v: '2',
-                        ps: outbound.tag.replace(/-vmess$/, ''), // 移除可能的-vmess后缀
+                        ps: outbound.tag, // 使用完整的 tag 作为 ps
                         add: outbound.server,
                         port: outbound.server_port.toString(),
                         id: outbound.uuid,
