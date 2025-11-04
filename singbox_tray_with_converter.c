@@ -1,29 +1,3 @@
-/* * singbox_tray_with_converter.c
- * * (Refactored Hybrid Version)
- * 1. Process Crash Monitoring (MonitorThread)
- * 2. Stdout/Stderr Log Monitoring (LogMonitorThread)
- * 3. Log Viewer Window to display live sing-box output
- * 4. Auto-fix duplicate tags on startup (silently)
- * 5. Full Node Management (Add, Delete, Modify, Pin, Sort, Deduplicate)
- * 6. Node Converter (from HTML resource)
- * 7. (NEW) Hybrid Startup Logic:
- * - If 'set.ini' [Settings] ConfigUrl is EMPTY:
- * -> Run in LOCAL mode (File 1 logic: CreateDefault, FixDuplicates).
- * - If 'set.ini' [Settings] ConfigUrl is SET:
- * -> Run in REMOTE mode (File 2 logic: Download config, fallback to cache).
- * -> (MODIFIED): If download fails AND no cache exists, fallback to LOCAL mode (CreateDefault).
- *
- * (Modification): Node switching now targets 'route.final'
- * (Modification): Add/Delete/Update nodes now syncs with '自动切换' selector
- * (Modification): Hide tray icon = Hide bubble tips
- * (Modification): Log viewer window correctly receives logs when hidden
- * (Modification): (--- 已移除 ---) Icon load failure warning.
- * (Modification): (--- 已修改 ---) Node Management / Converter menus are ALWAYS enabled.
- * (Modification): (--- 优化 ---) 启动逻辑异步化 (InitThread)，防止UI卡顿。
- * (Modification): (--- 优化 ---) 配置文件下载到系统临时目录。
- * (Modification): (--- 修复 ---) 解决下载时跨盘符移动文件 (ERROR_NOT_SAME_DEVICE) 的问题。
- */
-
 #define UNICODE
 #define _UNICODE
 
@@ -207,7 +181,7 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 
 // 辅助函数
 // =========================================================================
-// (--- 已修改：修改 ShowTrayTip 以始终包含 NIF_GUID ---)
+// (--- 已修改：使用本地副本显示汽泡，避免修改全局 nid.uFlags ---)
 // =========================================================================
 void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     // (--- 新增修改 ---)
@@ -217,17 +191,24 @@ void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     }
     // (--- 修改结束 ---)
 
-    // (--- 已修改：始终包含 NIF_GUID 标志 ---)
-    nid.uFlags = NIF_INFO | NIF_GUID;
-    nid.dwInfoFlags = NIIF_INFO;
-    wcsncpy(nid.szInfoTitle, title, ARRAYSIZE(nid.szInfoTitle) - 1);
-    nid.szInfoTitle[ARRAYSIZE(nid.szInfoTitle) - 1] = L'\0';
-    wcsncpy(nid.szInfo, message, ARRAYSIZE(nid.szInfo) - 1);
-    nid.szInfo[ARRAYSIZE(nid.szInfo) - 1] = L'\0';
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    // (--- 关键修复：创建一个本地副本 ---)
+    // 我们只修改副本的 uFlags，不修改全局 nid.uFlags
+    // 这可以防止与 ToggleTrayIconVisibility 发生冲突
+    NOTIFYICONDATAW nid_tip = nid;
+
+    // (--- 已修改：在副本上设置标志 ---)
+    nid_tip.uFlags = NIF_INFO | NIF_GUID;
+    nid_tip.dwInfoFlags = NIIF_INFO;
+    wcsncpy(nid_tip.szInfoTitle, title, ARRAYSIZE(nid_tip.szInfoTitle) - 1);
+    nid_tip.szInfoTitle[ARRAYSIZE(nid_tip.szInfoTitle) - 1] = L'\0';
+    wcsncpy(nid_tip.szInfo, message, ARRAYSIZE(nid_tip.szInfo) - 1);
+    nid_tip.szInfo[ARRAYSIZE(nid_tip.szInfo) - 1] = L'\0';
     
-    // (--- 已修改：重置标志时也保留 NIF_GUID ---)
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
+    // (--- 已修改：使用副本调用 NIM_MODIFY ---)
+    Shell_NotifyIconW(NIM_MODIFY, &nid_tip);
+    
+    // (--- 已移除：不再需要重置全局 nid.uFlags ---)
+    // nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID; // <-- 已移除
 }
 
 
@@ -350,9 +331,21 @@ void SaveSettings() {
 }
 // =========================================================================
 
+// =========================================================================
+// (--- 已修改：在 NIM_ADD 后必须调用 NIM_SETVERSION ---)
+// =========================================================================
 void ToggleTrayIconVisibility() {
-    if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); }
-    else { Shell_NotifyIconW(NIM_ADD, &nid); }
+    if (g_isIconVisible) { 
+        Shell_NotifyIconW(NIM_DELETE, &nid); 
+    }
+    else { 
+        Shell_NotifyIconW(NIM_ADD, &nid); 
+        
+        // (--- 关键修复：重新添加图标后，必须重新设置版本 ---)
+        // 否则后续的 Toast 通知会失败
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    }
     g_isIconVisible = !g_isIconVisible;
     SaveSettings();
 }
@@ -1286,11 +1279,7 @@ BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNe
     // 4. 其他未知错误
     return FALSE;
 }
-// =========================================================================
-// (--- 新增：从文件2集成的下载功能 ---)
-// (--- 已修正：使用绝对路径启动 curl.exe ---)
-// (--- 已修改：将 ShowError 弹窗改为 ShowTrayTip 汽泡通知 ---)
-// =========================================================================
+
 BOOL DownloadConfig(const wchar_t* url, const wchar_t* savePath) {
     wchar_t cmdLine[4096]; 
     wchar_t fullSavePath[MAX_PATH];
