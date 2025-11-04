@@ -1097,30 +1097,37 @@ void OpenConverterHtmlFromResource() {
         ShellExecuteW(NULL, L"open", tempFileName, NULL, NULL, SW_SHOWNORMAL);
     }
 }
-
 // =========================================================================
 // (已修改) 生成默认配置文件 (匹配 route.final 逻辑)
+// (--- 已修改：使用用户提供的 config.json 作为模板 ---)
 // =========================================================================
 void CreateDefaultConfig() {
     // (--- 已修改 ---)
-    // 使用一个更完整、更符合当前路由(route.final)结构的默认配置
+    // 使用用户提供的 config.json 内容作为默认配置
     const char* defaultConfig =
         "{\n"
         "\t\"log\": {\n"
-        "\t\t\"level\": \"debug\",\n" // 匹配用户配置中的日志级别
-        "\t\t\"disabled\": false\n"
+        "\t\t\"disabled\": false,\n"
+        "\t\t\"level\": \"debug\"\n"
         "\t},\n"
         "\t\"dns\": {\n"
         "\t\t\"servers\": [\n"
         "\t\t\t{\n"
-        "\t\t\t\t\"tag\": \"dns-direct\",\n"
-        "\t\t\t\t\"address\": \"119.29.29.29\",\n" // 腾讯 DNS
-        "\t\t\t\t\"detour\": \"直接连接\"\n"
+        "\t\t\t\t\"tag\": \"dns_resolver-tx\",\n"
+        "\t\t\t\t\"address\": \"119.29.29.29\",\n"
+        "\t\t\t\t\"detour\": \"🎯 全球直连\"\n"
         "\t\t\t},\n"
         "\t\t\t{\n"
-        "\t\t\t\t\"tag\": \"dns-proxy\",\n"
-        "\t\t\t\t\"address\": \"https://1.1.1.1/dns-query\",\n" // CF DNS
-        "\t\t\t\t\"detour\": \"自动切换\"\n" // 假设 '自动切换' 是代理
+        "\t\t\t\t\"tag\": \"dns-direct-tx\",\n"
+        "\t\t\t\t\"address\": \"https://doh.pub/dns-query\",\n"
+        "\t\t\t\t\"address_resolver\": \"dns_resolver-tx\",\n"
+        "\t\t\t\t\"detour\": \"🎯 全球直连\"\n"
+        "\t\t\t},\n"
+        "\t\t\t{\n"
+        "\t\t\t\t\"tag\": \"dns-proxy-cf\",\n"
+        "\t\t\t\t\"address\": \"https://cloudflare-dns.com/dns-query\",\n"
+        "\t\t\t\t\"address_resolver\": \"dns_resolver-tx\",\n"
+        "\t\t\t\t\"detour\": \"🎈 自动选择\"\n"
         "\t\t\t},\n"
         "\t\t\t{\n"
         "\t\t\t\t\"tag\": \"dns-block\",\n"
@@ -1129,73 +1136,78 @@ void CreateDefaultConfig() {
         "\t\t],\n"
         "\t\t\"rules\": [\n"
         "\t\t\t{\n"
-        "\t\t\t\t\"domain_suffix\": [\".cn\", \"qq.com\", \"tencent.com\"],\n"
-        "\t\t\t\t\"server\": \"dns-direct\"\n"
+        "\t\t\t\t\"domain_suffix\": [\n"
+        "\t\t\t\t\t\"visa.com.tw\",\n"
+        "\t\t\t\t\t\"visa.com.sg\",\n"
+        "\t\t\t\t\t\"visa.com\",\n"
+        "\t\t\t\t\t\"abrdns.com\"\n"
+        "\t\t\t\t],\n"
+        "\t\t\t\t\"server\": \"dns-direct-tx\"\n"
         "\t\t\t}\n"
         "\t\t],\n"
-        "\t\t\"final\": \"dns-proxy\",\n" // 默认使用代理DNS
-        "\t\t\"strategy\": \"ipv4_only\"\n"
+        "\t\t\"strategy\": \"ipv4_only\",\n"
+        "\t\t\"final\": \"dns-proxy-cf\"\n"
         "\t},\n"
         "\t\"inbounds\": [\n"
         "\t\t{\n"
-        "\t\t\t\"type\": \"http\",\n"
         "\t\t\t\"tag\": \"http-in\",\n"
+        "\t\t\t\"type\": \"http\",\n"
         "\t\t\t\"listen\": \"127.0.0.1\",\n"
         "\t\t\t\"listen_port\": 10809\n"
         "\t\t}\n"
         "\t],\n"
         "\t\"outbounds\": [\n"
         "\t\t{\n"
-        "\t\t\t\"tag\": \"直接连接\",\n"
+        "\t\t\t\"tag\": \"🎈 自动选择\",\n"
+        "\t\t\t\"type\": \"urltest\",\n"
+        "\t\t\t\"outbounds\": [\n"
+        "\t\t\t\t\"SEA\"\n"
+        "\t\t\t],\n"
+        "\t\t\t\"url\": \"http://www.gstatic.com/generate_204\",\n"
+        "\t\t\t\"interval\": \"10m\",\n"
+        "\t\t\t\"tolerance\": 50\n"
+        "\t\t},\n"
+        "\t\t{\n"
+        "\t\t\t\"tag\": \"🎯 全球直连\",\n"
         "\t\t\t\"type\": \"direct\"\n"
         "\t\t},\n"
         "\t\t{\n"
-        "\t\t\t\"tag\": \"阻塞\",\n"
+        "\t\t\t\"tag\": \"🚫 断开连接\",\n"
         "\t\t\t\"type\": \"block\"\n"
         "\t\t},\n"
         "\t\t{\n"
-        "\t\t\t\"tag\": \"vless-default\",\n" // 默认的占位节点
         "\t\t\t\"type\": \"vless\",\n"
-        "\t\t\t\"server\": \"your.server.com\",\n"
+        "\t\t\t\"tag\": \"xxx\",\n"
+        "\t\t\t\"server\": \"xxx.xxx.xxx.xxx\",\n"
         "\t\t\t\"server_port\": 443,\n"
-        "\t\t\t\"uuid\": \"00000000-0000-0000-0000-000000000000\",\n"
+        "\t\t\t\"uuid\": \"xxx-xxx-xxx-bb87-b06f9ddc5e89\",\n"
+        "\t\t\t\"flow\": \"\",\n"
         "\t\t\t\"tls\": {\n"
         "\t\t\t\t\"enabled\": true,\n"
-        "\t\t\t\t\"server_name\": \"your.server.com\"\n"
+        "\t\t\t\t\"server_name\": \"xxx.xxx.xxx\"\n"
+        "\t\t\t},\n"
+        "\t\t\t\"transport\": {\n"
+        "\t\t\t\t\"type\": \"ws\",\n"
+        "\t\t\t\t\"path\": \"/?ed=2560\",\n"
+        "\t\t\t\t\"headers\": {\n"
+        "\t\t\t\t\t\"Host\": \"xxx.xxx.xxx\"\n"
+        "\t\t\t\t}\n"
         "\t\t\t}\n"
-        "\t\t},\n"
-        "\t\t{\n"
-        "\t\t\t\"tag\": \"自动切换\",\n" // 匹配用户配置的 selector
-        "\t\t\t\"type\": \"selector\",\n"
-        "\t\t\t\"outbounds\": [\n"
-        "\t\t\t\t\"vless-default\",\n"
-        "\t\t\t\t\"直接连接\",\n"
-        "\t\t\t\t\"阻塞\"\n"
-        "\t\t\t],\n"
-        "\t\t\t\"default\": \"vless-default\"\n"
         "\t\t}\n"
         "\t],\n"
         "\t\"route\": {\n"
         "\t\t\"rules\": [\n"
         "\t\t\t{\n"
-        "\t\t\t\t\"domain_suffix\": [\".cn\", \"qq.com\", \"tencent.com\"],\n"
-        "\t\t\t\t\"outbound\": \"直接连接\"\n"
-        "\t\t\t},\n"
-        "\t\t\t{\n"
-        "\t\t\t\t\"ip_cidr\": [\"119.29.29.29\", \"1.1.1.1\"],\n" // DNS服务器
-        "\t\t\t\t\"outbound\": \"直接连接\"\n"
+        "\t\t\t\t\"ip_cidr\": [\n"
+        "\t\t\t\t\t\"119.29.29.29\",\n"
+        "\t\t\t\t\t\"120.53.53.53\"\n"
+        "\t\t\t\t],\n"
+        "\t\t\t\t\"outbound\": \"🎯 全球直连\"\n"
         "\t\t\t}\n"
         "\t\t],\n"
-        "\t\t\"final\": \"自动切换\",\n" // (--- 关键修改 ---) 默认路由指向 '自动切换'
+        "\t\t\"final\": \"SEA\",\n"
         "\t\t\"auto_detect_interface\": true,\n"
         "\t\t\"find_process\": true\n"
-        "\t},\n"
-        "\t\"experimental\": {\n"
-        "\t\t\"clash_api\": {\n"
-        "\t\t\t\"external_controller\": \"127.0.0.1:9090\",\n"
-        "\t\t\t\"external_ui\": \"ui\",\n"
-        "\t\t\t\"default_mode\": \"rule\"\n"
-        "\t\t}\n"
         "\t}\n"
         "}";
 
@@ -1205,7 +1217,7 @@ void CreateDefaultConfig() {
         fclose(f);
         MessageBoxW(NULL,
             L"未找到 config.json，已为您生成默认配置文件。\n\n"
-            L"请在使用前修改 config.json 中的 'vless-default' 节点信息。", // (--- 已修改提示 ---)
+            L"请在使用前修改 config.json 中的 'xxx' 节点信息。", // (--- 已修改提示 ---)
             L"提示", MB_OK | MB_ICONINFORMATION);
     } else {
         MessageBoxW(NULL, L"无法创建默认的 config.json 文件。", L"错误", MB_OK | MB_ICONERROR);
@@ -2021,7 +2033,7 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hWnd);
             break;
         case WM_DESTROY: {
-        HFONT hFont = (HFONT)SendMessage(GetDlgItem(hWnd, ID_ADD_EDIT_CONTENT), WM_GETFONT, 0, 0);
+             HFONT hFont = (HFONT)SendMessage(GetDlgItem(hWnd, ID_ADD_EDIT_CONTENT), WM_GETFONT, 0, 0);
              if (hFont) DeleteObject(hFont);
              break;
         }
@@ -2062,26 +2074,17 @@ BOOL DeleteNodeByTag(const wchar_t* tagToDelete) {
     // 1. 检查是否为特殊节点 (这些节点不应在 selector 中)
     if (strcmp(tagToDeleteMb, "直接连接") != 0 &&
         strcmp(tagToDeleteMb, "阻塞") != 0 &&
-        strcmp(tagToDeleteMb, "自动切换") != 0 &&
-        // (--- 补充匹配 config.json ---)
-        strcmp(tagToDeleteMb, "🎯 全球直连") != 0 &&
-        strcmp(tagToDeleteMb, "🚫 断开连接") != 0 &&
-        strcmp(tagToDeleteMb, "🎈 自动选择") != 0 &&
-        strcmp(tagToDeleteMb, "🐟 漏网之鱼") != 0 &&
-        strcmp(tagToDeleteMb, "🌍 GLOBAL") != 0
-        )
+        strcmp(tagToDeleteMb, "自动切换") != 0)
     {
-        // 2. 遍历 outbounds 找到 "自动切换" (或 "🎈 自动选择") 节点
+        // 2. 遍历 outbounds 找到 "自动切换" 节点
         cJSON* outbound_iter = NULL;
         cJSON_ArrayForEach(outbound_iter, outbounds) {
             cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
             cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
             
-            // (--- 兼容 config.json ---)
-            if (cJSON_IsString(tag_item) && 
-                (strcmp(tag_item->valuestring, "自动切换") == 0 || strcmp(tag_item->valuestring, "🎈 自动选择") == 0) &&
-                cJSON_IsString(type_item) && 
-                (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
+            // (--- 已修改：匹配用户配置中的 "🎈 自动选择" ---)
+            if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "🎈 自动选择") == 0 &&
+                cJSON_IsString(type_item) && (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
             {
                 // 3. 找到了 selector/urltest, 遍历其内部的 outbounds 数组
                 cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
@@ -2097,7 +2100,7 @@ BOOL DeleteNodeByTag(const wchar_t* tagToDelete) {
                         i++;
                     }
                 }
-                // (--- 不 break，因为可能有多个 selector/urltest 引用了它 ---)
+                break; // 假设只有一个 "🎈 自动选择"
             }
         }
     }
@@ -2239,28 +2242,19 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
         // 仅在 tag 确实发生变化时执行
         if (strcmp(oldTagMb, newTagMb) != 0) {
             // 1. 检查是否为特殊节点
-            if (strcmp(oldTagMb, "直接连接") != 0 &&
-                strcmp(oldTagMb, "阻塞") != 0 &&
-                strcmp(oldTagMb, "自动切换") != 0 &&
-                // (--- 补充匹配 config.json ---)
-                strcmp(oldTagMb, "🎯 全球直连") != 0 &&
+            if (strcmp(oldTagMb, "🎯 全球直连") != 0 &&
                 strcmp(oldTagMb, "🚫 断开连接") != 0 &&
-                strcmp(oldTagMb, "🎈 自动选择") != 0 &&
-                strcmp(oldTagMb, "🐟 漏网之鱼") != 0 &&
-                strcmp(oldTagMb, "🌍 GLOBAL") != 0
-                )
+                strcmp(oldTagMb, "🎈 自动选择") != 0)
             {
-                // 2. 遍历 outbounds 找到 "自动切换" (或 "🎈 自动选择") 节点
+                // 2. 遍历 outbounds 找到 "自动切换" 节点
                 cJSON* outbound_iter = NULL;
                 cJSON_ArrayForEach(outbound_iter, outbounds) {
                     cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
                     cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
                     
-                    // (--- 兼容 config.json ---)
-                    if (cJSON_IsString(tag_item) && 
-                        (strcmp(tag_item->valuestring, "自动切换") == 0 || strcmp(tag_item->valuestring, "🎈 自动选择") == 0) &&
-                        cJSON_IsString(type_item) && 
-                        (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
+                    // (--- 已修改：匹配用户配置中的 "🎈 自动选择" ---)
+                    if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "🎈 自动选择") == 0 &&
+                        cJSON_IsString(type_item) && (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
                     {
                         // 3. 找到了 selector/urltest, 遍历其内部的 outbounds 数组
                         cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
@@ -2274,7 +2268,7 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
                                 }
                             }
                         }
-                        // (--- 不 break ---)
+                        break; 
                     }
                 }
             }
@@ -2343,28 +2337,19 @@ BOOL AddNodeToConfig(const char* newNodeContentJson) {
 
         // (--- 新增逻辑：将新 tag 添加到 "自动切换" selector ---)
         // 1. 检查是否为特殊节点
-        if (strcmp(newTagMb, "直接连接") != 0 &&
-            strcmp(newTagMb, "阻塞") != 0 &&
-            strcmp(newTagMb, "自动切换") != 0 &&
-            // (--- 补充匹配 config.json ---)
-            strcmp(newTagMb, "🎯 全球直连") != 0 &&
+        if (strcmp(newTagMb, "🎯 全球直连") != 0 &&
             strcmp(newTagMb, "🚫 断开连接") != 0 &&
-            strcmp(newTagMb, "🎈 自动选择") != 0 &&
-            strcmp(newTagMb, "🐟 漏网之鱼") != 0 &&
-            strcmp(newTagMb, "🌍 GLOBAL") != 0
-            )
+            strcmp(newTagMb, "🎈 自动选择") != 0)
         {
-            // 2. 遍历 outbounds 找到 "自动切换" (或 "🎈 自动选择") 节点
+            // 2. 遍历 outbounds 找到 "自动切换" 节点
             cJSON* outbound_iter = NULL;
             cJSON_ArrayForEach(outbound_iter, outbounds) {
                 cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
                 cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
                 
-                // (--- 兼容 config.json ---)
-                if (cJSON_IsString(tag_item) && 
-                    (strcmp(tag_item->valuestring, "自动切换") == 0 || strcmp(tag_item->valuestring, "🎈 自动选择") == 0) &&
-                    cJSON_IsString(type_item) && 
-                    (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
+                // (--- 已修改：匹配用户配置中的 "🎈 自动选择" ---)
+                if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "🎈 自动选择") == 0 &&
+                    cJSON_IsString(type_item) && (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
                 {
                     // 3. 找到了 selector/urltest, 获取其内部的 outbounds 数组
                     cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
@@ -2372,7 +2357,7 @@ BOOL AddNodeToConfig(const char* newNodeContentJson) {
                         // 4. 将新节点的 tag 字符串添加进去
                         cJSON_AddItemToArray(selector_outbounds, cJSON_CreateString(newTagMb));
                     }
-                    // (--- 不 break ---)
+                    break; 
                 }
             }
         }

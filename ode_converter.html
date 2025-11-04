@@ -229,16 +229,62 @@
                     };
                 }
 
-                // HYSTERIA2
+                // --- HYSTERIA2 (已修复) ---
                 if (protocol === 'hysteria2') {
-                    const u = new URL(url);
-                    const params = Object.fromEntries(u.searchParams.entries());
+                    const urlWithoutProtocol = url.substring(url.indexOf('://') + 3);
+                    const hashIndex = urlWithoutProtocol.indexOf('#');
+                    const coreAndParams = hashIndex !== -1 ? urlWithoutProtocol.substring(0, hashIndex) : urlWithoutProtocol;
+                    const hashPart = hashIndex !== -1 ? decodeURIComponent(urlWithoutProtocol.substring(hashIndex + 1)) : '';
+
+                    let userInfo = '';
+                    let hostPortPathQueryString = coreAndParams;
+
+                    const atIndex = coreAndParams.indexOf('@');
+                    if (atIndex === -1) {
+                        throw new Error(`Invalid ${protocol} URL: No user info found.`);
+                    }
+                    userInfo = coreAndParams.substring(0, atIndex); // This is the password
+                    hostPortPathQueryString = coreAndParams.substring(atIndex + 1);
+
+                    let host = '';
+                    let port = '';
+                    let queryParams = {};
+
+                    // Use the 'http://' trick to parse
+                    const tempUrlForParsing = `http://${hostPortPathQueryString}`;
+                    try {
+                        const parsedTempUrl = new URL(tempUrlForParsing);
+                        host = parsedTempUrl.hostname;
+                        port = parsedTempUrl.port;
+                        queryParams = Object.fromEntries(parsedTempUrl.searchParams.entries());
+                    } catch (e) {
+                        console.error("Failed to parse hysteria2 URL with URL constructor:", tempUrlForParsing, e);
+                        // Manual fallback
+                        const queryIndex = hostPortPathQueryString.indexOf('?');
+                        const hostPort = queryIndex !== -1 ? hostPortPathQueryString.substring(0, queryIndex) : hostPortPathQueryString;
+                        host = hostPort.split(':')[0];
+                        port = hostPort.split(':')[1] || '';
+                        
+                        const queryString = queryIndex !== -1 ? hostPortPathQueryString.substring(queryIndex + 1) : '';
+                        if (queryString) {
+                            queryString.split('&').forEach(param => {
+                                const [key, value] = param.split('=');
+                                if (key) {
+                                    queryParams[key] = value ? decodeURIComponent(value.replace(/\+/g, ' ')) : '';
+                                }
+                            });
+                        }
+                    }
+
+                    const finalPort = port ? parseInt(port, 10) : 443;
+                    const params = queryParams; // Use the parsed queryParams
+
                     return {
                         type: 'hysteria2',
-                        server: u.hostname,
-                        port: parseInt(u.port || '443', 10),
-                        password: u.username,
-                        tag: decodeURIComponent(u.hash.replace('#', '')) || u.hostname,
+                        server: host,
+                        port: finalPort,
+                        password: userInfo, // Password is in userInfo
+                        tag: hashPart || host,
                         insecure: params.insecure === '1',
                         sni: params.sni,
                         obfs: params.obfs,
@@ -330,7 +376,6 @@
             return null;
         }
 
-        // --- 函数已更新 (匹配 config.json 结构) ---
         function convertNodes() {
             const nodeInput = document.getElementById('nodeInput').value;
             const outputConfig = document.getElementById('outputConfig');
@@ -342,7 +387,7 @@
             saveButton.disabled = true;
 
             const nodeUrls = nodeInput.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-            const parsedNodes = []; // 存储解析后的节点
+            const parsedNodes = []; // 存储所有解析后的节点对象
 
             nodeUrls.forEach(url => {
                 const parsed = parseUrl(url);
@@ -352,18 +397,17 @@
                 }
 
                 if (parsed.type === 'hysteria2') {
-                    // --- 逻辑更新：添加 hysteria2 的 tag 唯一性检查 ---
                     let tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                    // 确保标签是唯一的
                     const baseTag = tag;
                     let count = 1;
                     while (parsedNodes.some(n => n.tag === tag)) {
                         tag = `${baseTag}_${count++}`;
                     }
-                    // --- 逻辑更新结束 ---
-
+                    
                     const hysteria2Outbound = {
                         type: 'hysteria2',
-                        tag: tag, // 使用确保唯一的 tag
+                        tag: tag,
                         server: parsed.server,
                         server_port: parsed.port,
                         password: parsed.password
@@ -394,14 +438,12 @@
                     parsedNodes.push(hysteria2Outbound);
                 } else if (parsed.type === 'vless') {
                     let tag = (parsed.tag || parsed.server).replace(/[^a-zA-Z0-9.\-_]/g, '_');
-                    // 确保标签是唯一的，如果多个节点备注相同
+                    // 确保标签是唯一的
                     const baseTag = tag;
                     let count = 1;
                     while (parsedNodes.some(n => n.tag === tag)) {
                         tag = `${baseTag}_${count++}`;
                     }
-                    const currentVlessTag = tag;
-
 
                     let tlsObj = {};
                     if (parsed.params.security === 'reality') {
@@ -426,10 +468,10 @@
 
                     parsedNodes.push({
                         type: 'vless',
-                        tag: currentVlessTag,
+                        tag: tag,
                         server: parsed.server,
                         server_port: parsed.port,
-                        uuid: parsed.uuid, // Use parsed.uuid instead of userInfo
+                        uuid: parsed.uuid,
                         flow: parsed.params.flow || '',
                         tls: tlsObj,
                         ...(transportObj ? { transport: transportObj } : {})
@@ -442,7 +484,6 @@
                     while (parsedNodes.some(n => n.tag === tag)) {
                         tag = `${baseTag}_${count++}`;
                     }
-                    const currentTrojanTag = tag;
 
                     let tlsObj = {};
                     if (parsed.params.security === 'tls') {
@@ -462,7 +503,7 @@
 
                     parsedNodes.push({
                         type: 'trojan',
-                        tag: currentTrojanTag,
+                        tag: tag,
                         server: parsed.server,
                         server_port: parsed.port,
                         password: parsed.password,
@@ -477,7 +518,6 @@
                     while (parsedNodes.some(n => n.tag === tag)) {
                         tag = `${baseTag}_${count++}`;
                     }
-                    const currentVmessTag = tag;
 
                     let tlsObj = null;
                     if (parsed.tls === 'tls') {
@@ -499,7 +539,7 @@
 
                     parsedNodes.push({
                         type: 'vmess',
-                        tag: currentVmessTag,
+                        tag: tag,
                         server: parsed.server,
                         server_port: parseInt(parsed.port, 10),
                         uuid: parsed.uuid,
@@ -515,36 +555,29 @@
                 return;
             }
 
-            // --- 匹配 config.json (新结构) 的结构 ---
+            // --- 逻辑修改开始 ---
+            // 严格按照你提供的 config.json 模板进行重构
 
-            const nodeTags = parsedNodes.map(node => node.tag);
-            
-            // 定义功能性标签
-            const tagAuto = "🎈 自动选择";
-            const tagDirect = "🎯 全球直连";
-            const tagBlock = "🚫 断开连接";
-            const tagFallback = "🐟 漏网之鱼";
-            const tagGlobal = "🌍 GLOBAL";
-
+            const nodeTags = parsedNodes.map(node => node.tag); // 获取所有解析出的节点标签
 
             const config = {
                 "log": {
                     "disabled": false,
-                    "level": "error" // 级别改为 error
+                    "level": "debug"
                 },
-                "experimental": { // 匹配新结构
-                    "clash_api": {
-                        "external_controller": "127.0.0.1:9090",
-                        "external_ui": "ui",
-                        "default_mode": "rule"
-                    },
-                    "cache_file": { // 添加 cache_file
-                        "enabled": true,
-                        "path": "cache.db",
-                        "store_fakeip": true,
-                        "store_rdrc": true,  // 根据示例 config 添加
-                        "rdrc_timeout": "7d" // 根据示例 config 添加
-                    }
+                "dns": {
+                    "servers": [
+                        { "tag": "dns_resolver-tx", "address": "119.29.29.29", "detour": "🎯 全球直连" },
+                        { "tag": "dns-direct-tx", "address": "https://doh.pub/dns-query", "address_resolver": "dns_resolver-tx", "detour": "🎯 全球直连" },
+                        { "tag": "dns-proxy-cf", "address": "https://cloudflare-dns.com/dns-query", "address_resolver": "dns_resolver-tx", "detour": "🎈 自动选择" },
+                        { "tag": "dns-block", "address": "rcode://refused" }
+                    ],
+                    "rules": [
+                        // 保留模板中的示例规则
+                        { "domain_suffix": ["visa.com.tw", "visa.com.sg", "visa.com", "abrdns.com"], "server": "dns-direct-tx" }
+                    ],
+                    "strategy": "ipv4_only",
+                    "final": "dns-proxy-cf"
                 },
                 "inbounds": [
                     {
@@ -556,132 +589,43 @@
                 ],
                 "outbounds": [
                     {
-                        "type": "urltest", // 更改为 urltest
-                        "tag": tagAuto,
-                        "url": "https://www.gstatic.com/generate_204",
-                        "interval": "3m",
-                        "tolerance": 150,
-                        "interrupt_exist_connections": true, // 根据示例 config 添加
-                        "outbounds": nodeTags // 仅包含节点 tags
+                        "tag": "🎈 自动选择",
+                        "type": "urltest",
+                        "outbounds": nodeTags, // <-- 动态注入所有节点标签
+                        "url": "http://www.gstatic.com/generate_204",
+                        "interval": "10m",
+                        "tolerance": 50
                     },
                     {
-                        "type": "direct",
-                        "tag": tagDirect // 更新 tag
-                    },
-                    { // 添加新 selector
-                        "type": "selector",
-                        "tag": tagFallback,
-                        "interrupt_exist_connections": true, // 根据示例 config 添加
-                        "outbounds": [tagAuto, tagDirect]
-                    },
-                    { // 添加新 selector
-                        "type": "selector",
-                        "tag": tagGlobal,
-                        "interrupt_exist_connections": true, // 根据示例 config 添加
-                        "outbounds": [tagAuto, tagDirect, tagFallback]
+                        "tag": "🎯 全球直连",
+                        "type": "direct"
                     },
                     {
-                        "tag": tagBlock, // 更新 tag
+                        "tag": "🚫 断开连接",
                         "type": "block"
                     },
-                    ...parsedNodes // 将所有解析的节点对象附加在后面
+                    ...parsedNodes // <-- 动态注入所有解析出的节点对象
                 ],
                 "route": {
                     "rules": [
-                        // 更新规则以匹配新配置
-                        {
-                            "domain_suffix": ["doh.pub", "cloudflare-dns.com"],
-                            "outbound": tagDirect
-                        },
+                         // 保留模板中的示例规则
                         {
                             "ip_cidr": ["119.29.29.29", "120.53.53.53"],
-                            "outbound": tagDirect
-                        },
-                        { // 根据示例 config 添加 Ads 规则
-                            "action": "reject", 
-                            "rule_set": "Category-Ads"
-                        },
-                        {
-                            "rule_set": ["GeoSite-Private", "GeoIP-Private"],
-                            "outbound": tagDirect
-                        },
-                        {
-                            "rule_set": ["GeoSite-CN", "GeoIP-CN"],
-                            "outbound": tagDirect
+                            "outbound": "🎯 全球直连"
                         }
                     ],
-                    "final": tagAuto, // 默认路由到 urltest
+                    "final": "🎈 自动选择", // 默认路由到 urltest 组
                     "auto_detect_interface": true,
-                    "find_process": true,
-                    "rule_set": [ // 添加 rule_set 定义
-                        { // 根据示例 config 添加 Ads
-                            "tag": "Category-Ads",
-                            "type": "remote",
-                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs",
-                            "format": "binary",
-                            "download_detour": tagDirect
-                        },
-                        {
-                            "tag": "GeoIP-Private",
-                            "type": "remote",
-                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/private.srs",
-                            "format": "binary",
-                            "download_detour": tagDirect
-                        },
-                        {
-                            "tag": "GeoSite-Private",
-                            "type": "remote",
-                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/private.srs",
-                            "format": "binary",
-                            "download_detour": tagDirect
-                        },
-                        {
-                            "tag": "GeoIP-CN",
-                            "type": "remote",
-                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
-                            "format": "binary",
-                            "download_detour": tagDirect
-                        },
-                        {
-                            "tag": "GeoSite-CN",
-                            "type": "remote",
-                            "url": "https://ghproxy.net/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
-                            "format": "binary",
-                            "download_detour": tagDirect
-                        }
-                    ]
-                },
-                "dns": {
-                    "servers": [
-                        // 更新 detour 标签
-                        { "tag": "dns_resolver-tx", "address": "119.29.29.29", "detour": tagDirect },
-                        { "tag": "dns-direct-tx", "address": "https://doh.pub/dns-query", "address_resolver": "dns_resolver-tx", "detour": tagDirect },
-                        { "tag": "dns-proxy-cf", "address": "https://cloudflare-dns.com/dns-query", "address_resolver": "dns_resolver-tx", "detour": tagAuto },
-                        { "tag": "dns-block", "address": "rcode://refused" }
-                    ],
-                    "rules": [
-                         // 更新规则
-                        {
-                            "domain_suffix": ["visa.com.tw", "visa.com.sg", "visa.com", "abrdns.com", "doh.pub", "cloudflare-dns.com"], // 根据示例 config 添加
-                            "server": "dns-direct-tx"
-                        },
-                        {
-                            "rule_set": "GeoSite-CN",
-                            "server": "dns-direct-tx"
-                        }
-                    ],
-                    "client_subnet": "119.37.192.0", // 添加 client_subnet
-                    "strategy": "ipv4_only",
-                    "final": "dns-proxy-cf"
+                    "find_process": true
                 }
             };
-            // --- 结构匹配结束 ---
+
+            // --- 逻辑修改结束 ---
 
             outputConfig.value = JSON.stringify(config, null, 2);
             saveButton.disabled = false;
         }
 
-        // --- 函数已更新 (匹配 config.json 结构) ---
         function reverseConvert() {
             const configInput = document.getElementById('configInput').value;
             const outputNodes = document.getElementById('outputNodes');
@@ -707,13 +651,6 @@
                 const type = outbound.type;
                 let url = '';
 
-                // --- 逻辑修改 ---
-                // 只转换节点，跳过 selector, direct, block, 以及新增的 urltest
-                if (type === 'selector' || type === 'direct' || type === 'block' || type === 'urltest') {
-                    return; 
-                }
-                // --- 逻辑修改结束 ---
-
                 if (type === 'hysteria2') {
                     let paramsStr = '';
                     if (outbound.tls) {
@@ -730,7 +667,7 @@
                     if (outbound.down_mbps) paramsStr += `down=${outbound.down_mbps}&`;
 
                     paramsStr = paramsStr.slice(0, -1); // Remove trailing &
-                    url = `hysteria2://${outbound.password}@${outbound.server}:${outbound.server_port}${paramsStr ? '?' + paramsStr : ''}#${encodeURIComponent(outbound.tag)}`;
+                    url = `hysteria2://${outbound.password}@${outbound.server}:${outbound.server_port}${paramsStr ? '?' + paramsStr : ''}#${outbound.tag}`;
                 } else if (type === 'vless') {
                     let paramsStr = '';
                     if (outbound.flow) paramsStr += `flow=${outbound.flow}&`;
@@ -771,11 +708,11 @@
                     }
                     if (transType !== 'tcp') paramsStr += `type=${transType}&`;
                     if (headerType !== 'none') paramsStr += `headerType=${headerType}&`;
-                    if (path !== '/' && path) paramsStr += `path=${encodeURIComponent(path)}&`; // 修正：确保 path 存在
-                    if (host !== outbound.server && host) paramsStr += `host=${encodeURIComponent(host)}&`;
+                    if (path !== '/') paramsStr += `path=${encodeURIComponent(path)}&`;
+                    if (host !== outbound.server) paramsStr += `host=${encodeURIComponent(host)}&`;
 
                     paramsStr = paramsStr.slice(0, -1); // Remove trailing &
-                    url = `vless://${outbound.uuid}@${outbound.server}:${outbound.server_port}?${paramsStr}#${encodeURIComponent(outbound.tag)}`;
+                    url = `vless://${outbound.uuid}@${outbound.server}:${outbound.server_port}?${paramsStr}#${outbound.tag}`;
                 } else if (type === 'trojan') {
                     let paramsStr = '';
                     let security = 'none';
@@ -799,15 +736,15 @@
                     }
                     if (transType !== 'tcp') paramsStr += `type=${transType}&`;
                     if (headerType !== 'none') paramsStr += `headerType=${headerType}&`;
-                    if (path !== '/' && path) paramsStr += `path=${encodeURIComponent(path)}&`; // 修正：确保 path 存在
-                    if (host !== outbound.server && host) paramsStr += `host=${encodeURIComponent(host)}&`;
+                    if (path !== '/') paramsStr += `path=${encodeURIComponent(path)}&`;
+                    if (host !== outbound.server) paramsStr += `host=${encodeURIComponent(host)}&`;
 
                     paramsStr = paramsStr.slice(0, -1);
-                    url = `trojan://${outbound.password}@${outbound.server}:${outbound.server_port}?${paramsStr}#${encodeURIComponent(outbound.tag)}`;
+                    url = `trojan://${outbound.password}@${outbound.server}:${outbound.server_port}?${paramsStr}#${outbound.tag}`;
                 } else if (type === 'vmess') {
                     const vmessObj = {
                         v: '2',
-                        ps: outbound.tag, // 使用完整的 tag 作为 ps
+                        ps: outbound.tag.replace('-vmess', ''),
                         add: outbound.server,
                         port: outbound.server_port.toString(),
                         id: outbound.uuid,
@@ -830,7 +767,7 @@
             });
 
             if (nodeUrls.length === 0) {
-                errorMessage.textContent = '没有找到有效的 outbounds 节点来反向转换。';
+                errorMessage.textContent = '没有找到有效的 outbounds 来反向转换。';
                 return;
             }
 
