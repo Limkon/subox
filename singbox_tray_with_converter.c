@@ -94,6 +94,7 @@ int nodeCount = 0;
 int nodeCapacity = 0;
 wchar_t currentNode[64] = L"";
 int httpPort = 0;
+int socksPort = 0; // (--- 新增：用于存储 SOCKS/Mixed 端口 ---)
 
 const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
@@ -137,6 +138,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 void OpenSettingsWindow();
 BOOL ParseTags();
 int GetHttpInboundPort();
+int GetSocksInboundPort(); // (--- 新增 ---)
 void StartSingBox();
 void SwitchNode(const wchar_t* tag);
 void SetSystemProxy(BOOL enable);
@@ -415,11 +417,13 @@ void OpenSettingsWindow() {
 
 // =========================================================================
 // (已修改) 解析 config.json 以获取节点列表和当前节点 (读取 route.final)
+// (--- 智能代理修改：分别检测 HTTP/Mixed 和 SOCKS/Mixed 端口 ---)
 // =========================================================================
 BOOL ParseTags() {
     CleanupDynamicNodes();
     currentNode[0] = L'\0';
-    httpPort = 0;
+    httpPort = 0; // (--- 关键：每次解析前重置 ---)
+    socksPort = 0; // (--- 关键：每次解析前重置 ---)
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) {
@@ -465,18 +469,38 @@ BOOL ParseTags() {
             MultiByteToWideChar(CP_UTF8, 0, final_outbound->valuestring, -1, currentNode, ARRAYSIZE(currentNode));
         }
     }
+
+    // --- (智能代理修改点) ---
     cJSON* inbounds = cJSON_GetObjectItem(root, "inbounds");
     cJSON* inbound = NULL;
     cJSON_ArrayForEach(inbound, inbounds) {
-        cJSON* type = cJSON_GetObjectItem(inbound, "type");
-        if (cJSON_IsString(type) && strcmp(type->valuestring, "http") == 0) {
-            cJSON* listenPort = cJSON_GetObjectItem(inbound, "listen_port");
-            if (cJSON_IsNumber(listenPort)) {
-                httpPort = listenPort->valueint;
-                break;
-            }
+        cJSON* type_item = cJSON_GetObjectItem(inbound, "type");
+        if (!cJSON_IsString(type_item)) continue;
+        
+        const char* type_str = type_item->valuestring;
+        
+        cJSON* listenPort_item = cJSON_GetObjectItem(inbound, "listen_port");
+        if (!cJSON_IsNumber(listenPort_item)) continue;
+        
+        int port = listenPort_item->valueint;
+
+        // 检查 "http" 或 "mixed" 类型，用于 HTTP 代理
+        if (httpPort == 0 && (strcmp(type_str, "http") == 0 || strcmp(type_str, "mixed") == 0)) {
+            httpPort = port;
+        }
+
+        // 检查 "socks" 或 "mixed" 类型，用于 SOCKS 代理
+        if (socksPort == 0 && (strcmp(type_str, "socks") == 0 || strcmp(type_str, "mixed") == 0)) {
+            socksPort = port;
+        }
+        
+        // 如果两者都找到了，可以提前退出循环
+        if (httpPort != 0 && socksPort != 0) {
+            break;
         }
     }
+    // --- (修改结束) ---
+
     cJSON_Delete(root);
     free(buffer);
     return TRUE;
@@ -485,6 +509,11 @@ BOOL ParseTags() {
 
 int GetHttpInboundPort() {
     return httpPort;
+}
+
+// (--- 新增函数：获取 SOCKS 端口 ---)
+int GetSocksInboundPort() {
+    return socksPort;
 }
 
 
@@ -702,12 +731,38 @@ void SwitchNode(const wchar_t* tag) {
 }
 
 void SetSystemProxy(BOOL enable) {
-    int port = GetHttpInboundPort();
-    if (port == 0 && enable) {
-        MessageBoxW(NULL, L"未找到HTTP入站端口，无法设置系统代理。", L"错误", MB_OK | MB_ICONERROR);
+    int hPort = GetHttpInboundPort();
+    int sPort = GetSocksInboundPort(); // (--- 新增 ---)
+
+    if (hPort == 0 && sPort == 0 && enable) { // (--- 修改：两者都为0才报错 ---)
+        MessageBoxW(NULL, L"未找到 HTTP 或 SOCKS (或 Mixed) 入站端口，无法设置系统代理。", L"错误", MB_OK | MB_ICONERROR);
         return;
     }
 
+    // (--- 智能代理修改：重构以支持 Win8+ (注册表) 和 Win7 (InternetSetOption) ---)
+    // (--- 统一使用 "http=...;socks=..." 格式写入 ProxyServer 字段 ---)
+
+    wchar_t proxyServerString[256] = {0};
+    wchar_t proxyBypassString[64] = {0};
+
+    if (enable) {
+        if (hPort > 0) {
+            wchar_t httpBuf[128];
+            wsprintfW(httpBuf, L"http=127.0.0.1:%d", hPort);
+            wcsncat(proxyServerString, httpBuf, ARRAYSIZE(proxyServerString) - 1);
+        }
+        if (sPort > 0) {
+            wchar_t socksBuf[128];
+            wsprintfW(socksBuf, L"socks=127.0.0.1:%d", sPort);
+            if (proxyServerString[0] != L'\0') { // 如果已有HTTP, 添加分号
+                wcsncat(proxyServerString, L";", ARRAYSIZE(proxyServerString) - wcslen(proxyServerString) - 1);
+            }
+            wcsncat(proxyServerString, socksBuf, ARRAYSIZE(proxyServerString) - wcslen(proxyServerString) - 1);
+        }
+        wcsncpy(proxyBypassString, L"<local>", ARRAYSIZE(proxyBypassString) - 1);
+    }
+    
+    // (--- Win8+ (及更高版本) 使用注册表 ---)
     if (IsWindows8OrGreater()) {
         HKEY hKey;
         if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
@@ -717,40 +772,46 @@ void SetSystemProxy(BOOL enable) {
 
         if (enable) {
             DWORD dwEnable = 1;
-            wchar_t proxyServer[64];
-            wsprintfW(proxyServer, L"127.0.0.1:%d", port);
-            const wchar_t* proxyBypass = L"<local>";
             RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServer, (wcslen(proxyServer) + 1) * sizeof(wchar_t));
-            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypass, (wcslen(proxyBypass) + 1) * sizeof(wchar_t));
+            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
+            
+            // (--- 清理旧的独立 SOCKS 键 (如果存在) ---)
+            RegDeleteValueW(hKey, L"SocksProxyServer"); 
         } else {
             DWORD dwEnable = 0;
             RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t)); // 清空
+            RegDeleteValueW(hKey, L"SocksProxyServer"); // 清空
         }
         RegCloseKey(hKey);
-    } else {
+    } 
+    // (--- 旧版 Windows (Win 7) 使用 InternetSetOptionW ---)
+    else {
         INTERNET_PER_CONN_OPTION_LISTW list;
         INTERNET_PER_CONN_OPTIONW options[3];
         DWORD dwBufSize = sizeof(list);
+        
         options[0].dwOption = INTERNET_PER_CONN_FLAGS;
         options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
         options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+        
         if (enable) {
-            wchar_t proxyServer[64];
-            wsprintfW(proxyServer, L"127.0.0.1:%d", port);
             options[0].Value.dwValue = PROXY_TYPE_PROXY;
-            options[1].Value.pszValue = proxyServer;
-            options[2].Value.pszValue = L"<local>";
+            options[1].Value.pszValue = proxyServerString;
+            options[2].Value.pszValue = proxyBypassString;
         } else {
             options[0].Value.dwValue = PROXY_TYPE_DIRECT;
             options[1].Value.pszValue = L"";
             options[2].Value.pszValue = L"";
         }
+        
         list.dwSize = sizeof(list);
         list.pszConnection = NULL;
         list.dwOptionCount = 3;
         list.dwOptionError = 0;
         list.pOptions = options;
+        
         if (!InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize)) {
             ShowError(L"代理设置失败", L"调用 InternetSetOptionW 失败。");
             return;
@@ -765,18 +826,63 @@ BOOL IsSystemProxyEnabled() {
     HKEY hKey;
     DWORD dwEnable = 0;
     DWORD dwSize = sizeof(dwEnable);
-    wchar_t proxyServer[MAX_PATH] = {0};
+    wchar_t proxyServer[1024] = {0}; // (--- 增大缓冲区以容纳组合字符串 ---)
     DWORD dwProxySize = sizeof(proxyServer);
-    int port = GetHttpInboundPort();
+    
+    int hPort = GetHttpInboundPort();
+    int sPort = GetSocksInboundPort(); // (--- 新增 ---)
+    
     BOOL isEnabled = FALSE;
+    
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
             if (dwEnable == 1) {
-                if (port > 0) {
-                    wchar_t expectedProxyServer[64];
-                    wsprintfW(expectedProxyServer, L"127.0.0.1:%d", port);
-                    if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
-                        if (wcscmp(proxyServer, expectedProxyServer) == 0) {
+                // (--- 修改：检查 HTTP 或 SOCKS 端口 ---)
+                
+                if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
+                    
+                    BOOL httpMatch = FALSE;
+                    BOOL socksMatch = FALSE;
+                    
+                    if (hPort > 0) {
+                        wchar_t expectedHttp[128];
+                        // 检查 "http=..." 格式
+                        wsprintfW(expectedHttp, L"http=127.0.0.1:%d", hPort);
+                        if (wcsstr(proxyServer, expectedHttp) != NULL) {
+                            httpMatch = TRUE;
+                        } else {
+                            // 兼容旧的或仅 HTTP 的设置 (例如 "127.0.0.1:10809")
+                            wchar_t expectedHttpLegacy[64];
+                            wsprintfW(expectedHttpLegacy, L"127.0.0.1:%d", hPort);
+                            // 必须完全匹配 (防止 "127.0.0.1:1080" 匹配 "127.0.0.1:10809")
+                            if (wcscmp(proxyServer, expectedHttpLegacy) == 0) {
+                                httpMatch = TRUE;
+                            }
+                        }
+                    }
+                    
+                    if (sPort > 0) {
+                         wchar_t expectedSocks[128];
+                         // 检查 "socks=..." 格式
+                         wsprintfW(expectedSocks, L"socks=127.0.0.1:%d", sPort);
+                         if (wcsstr(proxyServer, expectedSocks) != NULL) {
+                            socksMatch = TRUE;
+                         }
+                    }
+                    
+                    // (--- 智能检测逻辑 ---)
+                    if (hPort > 0 && sPort > 0 && hPort == sPort) {
+                        // (--- Mixed 端口: hPort 和 sPort 相同 ---)
+                        // 只要 http 或 socks 任一匹配即可
+                        if (httpMatch || socksMatch) isEnabled = TRUE;
+                    } 
+                    else {
+                        // (--- 独立端口 ---)
+                        // 我们期望的端口必须被匹配
+                        if (hPort > 0 && httpMatch) {
+                            isEnabled = TRUE;
+                        }
+                        if (sPort > 0 && socksMatch) {
                             isEnabled = TRUE;
                         }
                     }
