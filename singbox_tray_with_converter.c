@@ -42,7 +42,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
 #define ID_TRAY_SYSTEM_PROXY 1003
-#define ID_TRAY_OPEN_CONVERTER 1004
+// #define ID_TRAY_OPEN_CONVERTER 1004 // (--- 已移除 ---)
 #define ID_TRAY_SETTINGS 1005
 #define ID_TRAY_MANAGE_NODES 1006
 #define ID_TRAY_SHOW_CONSOLE 1007 // 新增：显示日志菜单ID
@@ -78,12 +78,8 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_HOTKEY_CTRL 101
 
-#ifndef IDR_HTML_CONVERTER
-#define IDR_HTML_CONVERTER 2
-#endif
-#ifndef RT_HTML
-#define RT_HTML L"HTML"
-#endif
+// (--- 已移除 IDR_HTML_CONVERTER 和 RT_HTML ---)
+
 
 // 全局变量
 NOTIFYICONDATAW nid;
@@ -151,7 +147,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void StopSingBox();
 void SetAutorun(BOOL enable);
 BOOL IsAutorunEnabled();
-void OpenConverterHtmlFromResource();
+// void OpenConverterHtmlFromResource(); // (--- 已移除 ---)
 char* ConvertLfToCrlf(const char* input);
 void CreateDefaultConfig();
 BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize); // (--- 新增 ---)
@@ -848,6 +844,7 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
 
 // =========================================================================
 // (--- 已修改：移除混合逻辑，菜单项始终可用 ---)
+// (--- 已修改：移除“节点转换” ---)
 // =========================================================================
 void UpdateMenu() {
     if (hMenu) DestroyMenu(hMenu);
@@ -861,11 +858,9 @@ void UpdateMenu() {
     }
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNodeSubMenu, L"切换节点");
 
-    // (--- 已修改：节点管理和转换始终可用 ---)
+    // (--- 已修改：节点管理始终可用 ---)
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MANAGE_NODES, L"管理节点");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_CONVERTER, L"节点转换");
-    // (--- 修改结束 ---)
+    // (--- “节点转换” 菜单项及其分隔符已移除 ---)
     
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_AUTORUN, L"开机启动");
@@ -920,9 +915,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             BOOL isEnabled = IsSystemProxyEnabled();
             SetSystemProxy(!isEnabled);
             ShowTrayTip(L"系统代理", isEnabled ? L"系统代理已关闭" : L"系统代理已开启");
-        } else if (id == ID_TRAY_OPEN_CONVERTER) {
-            // (--- 保留文件1的功能 ---)
-            OpenConverterHtmlFromResource();
+        // (--- 移除 ID_TRAY_OPEN_CONVERTER 的处理 ---)
         } else if (id == ID_TRAY_SETTINGS) {
             OpenSettingsWindow();
         } else if (id == ID_TRAY_MANAGE_NODES) {
@@ -1070,33 +1063,6 @@ BOOL IsAutorunEnabled() {
     return FALSE;
 }
 
-void OpenConverterHtmlFromResource() {
-    HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(IDR_HTML_CONVERTER), RT_HTML);
-    if (!hRes) {
-        MessageBoxW(NULL, L"找不到HTML资源。请在使用ResourceHacker手动嵌入后重试。", L"资源错误", MB_OK|MB_ICONERROR);
-        return;
-    }
-    HGLOBAL hMem = LoadResource(NULL, hRes);
-    if (!hMem) return;
-    void* pData = LockResource(hMem);
-    DWORD dwSize = SizeofResource(NULL, hRes);
-    if (!pData || dwSize == 0) return;
-    wchar_t tempPath[MAX_PATH], tempFileName[MAX_PATH];
-    GetTempPathW(ARRAYSIZE(tempPath), tempPath);
-    GetTempFileNameW(tempPath, L"sbx", 0, tempFileName);
-    wchar_t* dot = wcsrchr(tempFileName, L'.');
-    if (dot) {
-        wcsncpy(dot, L".html", (size_t)(tempFileName + ARRAYSIZE(tempFileName) - dot));
-    } else {
-        wcsncat(tempFileName, L".html", ARRAYSIZE(tempFileName) - wcslen(tempFileName) - 1);
-    }
-    FILE* f = NULL;
-    if (_wfopen_s(&f, tempFileName, L"wb") == 0 && f != NULL) {
-        fwrite(pData, 1, dwSize, f);
-        fclose(f);
-        ShellExecuteW(NULL, L"open", tempFileName, NULL, NULL, SW_SHOWNORMAL);
-    }
-}
 // =========================================================================
 // (已修改) 生成默认配置文件 (匹配 route.final 逻辑)
 // (--- 已修改：使用用户提供的 config.json 作为模板 ---)
