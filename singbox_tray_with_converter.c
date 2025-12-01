@@ -12,13 +12,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-#include <wininet.h> // 包含 WinINet 的宏定义
+#include <wininet.h>
 #include <commctrl.h>
-#include <time.h> // 用于重启冷却
+#include <time.h>
 
 #include "cJSON.c"
 
-// 为兼容旧版 SDK (如某些 MinGW 版本) 手动添加缺失的宏定义
 #ifndef NIF_GUID
 #define NIF_GUID 0x00000020
 #endif
@@ -27,28 +26,23 @@
 #define NOTIFYICON_VERSION_4 4
 #endif
 
-// 定义一个唯一的 GUID，仅用于程序单实例
-// {BFD8A583-662A-4FE3-9784-FAB78A3386A3}
 static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0xb7, 0x8a, 0x33, 0x86, 0xa3 } };
 
-
 #define WM_TRAY (WM_USER + 1)
-#define WM_SINGBOX_CRASHED (WM_USER + 2)     // 消息：核心进程崩溃
-#define WM_SINGBOX_RECONNECT (WM_USER + 3)   // 消息：日志检测到错误，请求提示 (不再切换)
-#define WM_LOG_UPDATE (WM_USER + 4)          // 消息：日志线程发送新的日志文本
-#define WM_INIT_COMPLETE (WM_USER + 5)       // (--- 新增：初始化线程完成消息 ---)
-#define WM_SHOW_TRAY_TIP (WM_USER + 6)       // (--- 新增：后台线程显示气泡提示 ---)
+#define WM_SINGBOX_CRASHED (WM_USER + 2)
+#define WM_SINGBOX_RECONNECT (WM_USER + 3)
+#define WM_LOG_UPDATE (WM_USER + 4)
+#define WM_INIT_COMPLETE (WM_USER + 5)
+#define WM_SHOW_TRAY_TIP (WM_USER + 6)
 
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
 #define ID_TRAY_SYSTEM_PROXY 1003
-// #define ID_TRAY_OPEN_CONVERTER 1004 // (--- 已移除 ---)
 #define ID_TRAY_SETTINGS 1005
 #define ID_TRAY_MANAGE_NODES 1006
-#define ID_TRAY_SHOW_CONSOLE 1007 // 新增：显示日志菜单ID
+#define ID_TRAY_SHOW_CONSOLE 1007
 #define ID_TRAY_NODE_BASE 2000
 
-// 节点管理窗口控件ID
 #define ID_NODEMGR_LISTBOX 3001
 #define ID_NODEMGR_MODIFY_BTN 3002
 #define ID_NODEMGR_DELETE_BTN 3003
@@ -60,72 +54,57 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define ID_NODEMGR_CONTEXT_DEDUPLICATE 3009
 #define ID_NODEMGR_CONTEXT_SORT_NODES 3010
 
-// 修改节点对话框控件ID
 #define ID_MODIFY_EDIT_CONTENT 4001
 #define ID_MODIFY_OK_BTN 4002
 #define ID_MODIFY_CANCEL_BTN 4003
 #define ID_MODIFY_FORMAT_BTN 4004
 
-// 添加节点对话框控件ID
 #define ID_ADD_EDIT_CONTENT 5001
 #define ID_ADD_OK_BTN 5002
 #define ID_ADD_CANCEL_BTN 5003
 #define ID_ADD_FORMAT_BTN 5004
 
-// 日志查看器窗口控件ID
 #define ID_LOGVIEWER_EDIT 6001
 
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_HOTKEY_CTRL 101
 
-// (--- 已移除 IDR_HTML_CONVERTER 和 RT_HTML ---)
-
-
-// 全局变量
 NOTIFYICONDATAW nid;
 HWND hwnd;
 HMENU hMenu, hNodeSubMenu;
 HANDLE hMutex = NULL;
 PROCESS_INFORMATION pi = {0};
-HFONT g_hFont = NULL; // 全局字体句柄
+HFONT g_hFont = NULL;
 
 wchar_t** nodeTags = NULL;
 int nodeCount = 0;
 int nodeCapacity = 0;
 wchar_t currentNode[64] = L"";
 int httpPort = 0;
-int socksPort = 0; // (--- 新增：用于存储 SOCKS/Mixed 端口 ---)
+int socksPort = 0;
 
 const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
-// 新增全局变量
 BOOL g_isIconVisible = TRUE;
 UINT g_hotkeyModifiers = 0;
 UINT g_hotkeyVk = 0;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
-wchar_t g_configUrl[2048] = {0}; // (--- 新增：用于存储配置URL ---)
+wchar_t g_configUrl[2048] = {0};
 
+HANDLE hMonitorThread = NULL;
+HANDLE hLogMonitorThread = NULL;
+HANDLE hChildStd_OUT_Rd_Global = NULL;
+BOOL g_isExiting = FALSE;
 
-// --- 重构：新增守护功能全局变量 ---
-HANDLE hMonitorThread = NULL;           // 进程崩溃监控线程
-HANDLE hLogMonitorThread = NULL;        // 进程日志监控线程
-HANDLE hChildStd_OUT_Rd_Global = NULL;  // 核心进程的标准输出管道（读取端）
-BOOL g_isExiting = FALSE;               // 标记是否为用户主动退出/切换
+HWND hLogViewerWnd = NULL;
+HFONT hLogFont = NULL;
 
-// --- 新增：日志窗口句柄 ---
-HWND hLogViewerWnd = NULL; // 日志查看器窗口句柄
-HFONT hLogFont = NULL;     // 日志窗口等宽字体
-// --- 重构结束 ---
-
-// 用于在窗口间传递数据的结构体
 typedef struct {
     wchar_t oldTag[256];
-    wchar_t newTag[256]; // 将在成功修改后被填充
+    wchar_t newTag[256];
     BOOL success;
 } MODIFY_NODE_PARAMS;
 
-
-// 函数声明
 void ShowTrayTip(const wchar_t* title, const wchar_t* message);
 void ShowError(const wchar_t* title, const wchar_t* message);
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize);
@@ -138,7 +117,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 void OpenSettingsWindow();
 BOOL ParseTags();
 int GetHttpInboundPort();
-int GetSocksInboundPort(); // (--- 新增 ---)
+int GetSocksInboundPort();
 void StartSingBox();
 void SwitchNode(const wchar_t* tag);
 void SetSystemProxy(BOOL enable);
@@ -149,15 +128,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void StopSingBox();
 void SetAutorun(BOOL enable);
 BOOL IsAutorunEnabled();
-// void OpenConverterHtmlFromResource(); // (--- 已移除 ---)
 char* ConvertLfToCrlf(const char* input);
 void CreateDefaultConfig();
-BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize); // (--- 新增 ---)
-BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName); // (--- 新增 ---)
-BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath); // (--- 修改：增加 hWndMain 参数 ---)
-void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message); // (--- 新增：后台发消息函数 ---)
+BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize);
+BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName);
+BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath);
+void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message);
 
-// 节点管理函数声明
 void OpenNodeManagerWindow();
 LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -169,23 +146,15 @@ BOOL AddNodeToConfig(const char* newNodeContentJson);
 BOOL PinNodeByTag(const wchar_t* tagToPin);
 int DeduplicateNodes();
 BOOL SortNodesByName();
-int FixDuplicateTags(); // 启动时自动修复功能
+int FixDuplicateTags();
 
-// --- 重构：新增日志查看器函数声明 ---
 void OpenLogViewerWindow();
 LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-// --- 重构结束 ---
 
-
-// 辅助函数
 void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
-    // (--- 新增修改 ---)
-    // 如果托盘图标当前是隐藏状态，则不显示任何气泡提示
     if (!g_isIconVisible) {
         return;
     }
-    // (--- 修改结束 ---)
-
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_INFO;
     wcsncpy(nid.szInfoTitle, title, ARRAYSIZE(nid.szInfoTitle) - 1);
@@ -195,7 +164,6 @@ void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
 }
-
 
 void ShowError(const wchar_t* title, const wchar_t* message) {
     DWORD errorCode = GetLastError();
@@ -220,17 +188,17 @@ void ShowError(const wchar_t* title, const wchar_t* message) {
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     FILE* f = NULL;
     if (_wfopen_s(&f, filename, L"rb") != 0 || !f) { 
-        *fileSize = 0; // (--- 修正 ---)
+        *fileSize = 0;
         return FALSE; 
     }
     fseek(f, 0, SEEK_END);
     *fileSize = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (*fileSize <= 0) { 
-        *fileSize = 0; // (--- 修正 ---)
+        *fileSize = 0;
         *buffer = NULL;
         fclose(f); 
-        return FALSE; // 文件为空也视为失败
+        return FALSE;
     }
     *buffer = (char*)malloc(*fileSize + 1);
     if (!*buffer) { fclose(f); return FALSE; }
@@ -239,6 +207,7 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     fclose(f);
     return TRUE;
 }
+
 void CleanupDynamicNodes() {
     if (nodeTags) {
         for (int i = 0; i < nodeCount; i++) { free(nodeTags[i]); }
@@ -260,24 +229,20 @@ BOOL IsWindows8OrGreater() {
 
 char* ConvertLfToCrlf(const char* input) {
     if (!input) return NULL;
-
     int lf_count = 0;
     for (const char* p = input; *p; p++) {
         if (*p == '\n' && (p == input || *(p-1) != '\r')) {
             lf_count++;
         }
     }
-
     if (lf_count == 0) {
         char* output = (char*)malloc(strlen(input) + 1);
         if(output) strcpy(output, input);
         return output;
     }
-
     size_t new_len = strlen(input) + lf_count;
     char* output = (char*)malloc(new_len + 1);
     if (!output) return NULL;
-
     char* dest = output;
     for (const char* src = input; *src; src++) {
         if (*src == '\n' && (src == input || *(src-1) != '\r')) {
@@ -288,18 +253,13 @@ char* ConvertLfToCrlf(const char* input) {
         }
     }
     *dest = '\0';
-
     return output;
 }
 
-// =========================================================================
-// (--- 已修改：集成 ConfigUrl ---)
-// =========================================================================
 void LoadSettings() {
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", 0, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 0, g_iniFilePath);
     g_isIconVisible = GetPrivateProfileIntW(L"Settings", L"ShowIcon", 1, g_iniFilePath);
-    // (--- 新增：读取URL，默认为空字符串 ---)
     GetPrivateProfileStringW(L"Settings", L"ConfigUrl", L"", g_configUrl, ARRAYSIZE(g_configUrl), g_iniFilePath);
 }
 
@@ -311,10 +271,8 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
     wsprintfW(buffer, L"%d", g_isIconVisible);
     WritePrivateProfileStringW(L"Settings", L"ShowIcon", buffer, g_iniFilePath);
-    // (--- 新增：保存URL ---)
     WritePrivateProfileStringW(L"Settings", L"ConfigUrl", g_configUrl, g_iniFilePath);
 }
-// =========================================================================
 
 void ToggleTrayIconVisibility() {
     if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); }
@@ -345,19 +303,15 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     static HWND hHotkey, hLabel, hOkBtn, hCancelBtn;
     switch (msg) {
         case WM_CREATE: {
-            // (--- 注意：此窗口未包含 ConfigUrl 编辑功能，用户需手动编辑 set.ini ---)
             hLabel = CreateWindowW(L"STATIC", L"显示/隐藏托盘图标快捷键:", WS_CHILD | WS_VISIBLE, 20, 20, 150, 20, hWnd, NULL, NULL, NULL);
             hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD | WS_VISIBLE | WS_BORDER, 20, 45, 240, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL, NULL);
             SendMessageW(hHotkey, HKM_SETHOTKEY, MAKEWORD(g_hotkeyVk, ModToHotkeyf(g_hotkeyModifiers)), 0);
             hOkBtn = CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 60, 85, 80, 25, hWnd, (HMENU)IDOK, NULL, NULL);
             hCancelBtn = CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE, 160, 85, 80, 25, hWnd, (HMENU)IDCANCEL, NULL, NULL);
-
-            // 应用字体
             SendMessage(hLabel, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hHotkey, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hOkBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hCancelBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
             break;
         }
         case WM_COMMAND: {
@@ -415,15 +369,11 @@ void OpenSettingsWindow() {
     }
 }
 
-// =========================================================================
-// (已修改) 解析 config.json 以获取节点列表和当前节点 (读取 route.final)
-// (--- 智能代理修改：分别检测 HTTP/Mixed 和 SOCKS/Mixed 端口 ---)
-// =========================================================================
 BOOL ParseTags() {
     CleanupDynamicNodes();
     currentNode[0] = L'\0';
-    httpPort = 0; // (--- 关键：每次解析前重置 ---)
-    socksPort = 0; // (--- 关键：每次解析前重置 ---)
+    httpPort = 0;
+    socksPort = 0;
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) {
@@ -462,180 +412,117 @@ BOOL ParseTags() {
     }
     cJSON* route = cJSON_GetObjectItem(root, "route");
     if (route) {
-        // (--- 新逻辑 ---)
-        // 直接从 route.final 读取当前节点
         cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
         if (cJSON_IsString(final_outbound) && final_outbound->valuestring) {
             MultiByteToWideChar(CP_UTF8, 0, final_outbound->valuestring, -1, currentNode, ARRAYSIZE(currentNode));
         }
     }
-
-    // --- (智能代理修改点) ---
     cJSON* inbounds = cJSON_GetObjectItem(root, "inbounds");
     cJSON* inbound = NULL;
     cJSON_ArrayForEach(inbound, inbounds) {
         cJSON* type_item = cJSON_GetObjectItem(inbound, "type");
         if (!cJSON_IsString(type_item)) continue;
-        
         const char* type_str = type_item->valuestring;
-        
         cJSON* listenPort_item = cJSON_GetObjectItem(inbound, "listen_port");
         if (!cJSON_IsNumber(listenPort_item)) continue;
-        
         int port = listenPort_item->valueint;
-
-        // 检查 "http" 或 "mixed" 类型，用于 HTTP 代理
         if (httpPort == 0 && (strcmp(type_str, "http") == 0 || strcmp(type_str, "mixed") == 0)) {
             httpPort = port;
         }
-
-        // 检查 "socks" 或 "mixed" 类型，用于 SOCKS 代理
         if (socksPort == 0 && (strcmp(type_str, "socks") == 0 || strcmp(type_str, "mixed") == 0)) {
             socksPort = port;
         }
-        
-        // 如果两者都找到了，可以提前退出循环
         if (httpPort != 0 && socksPort != 0) {
             break;
         }
     }
-    // --- (修改结束) ---
-
     cJSON_Delete(root);
     free(buffer);
     return TRUE;
 }
 
-
 int GetHttpInboundPort() {
     return httpPort;
 }
 
-// (--- 新增函数：获取 SOCKS 端口 ---)
 int GetSocksInboundPort() {
     return socksPort;
 }
 
-
-// --- 重构：新增守护线程函数 ---
-
-// 监视 sing-box 核心进程是否崩溃的线程函数
 DWORD WINAPI MonitorThread(LPVOID lpParam) {
     HANDLE hProcess = (HANDLE)lpParam;
-    
-    // 阻塞等待，直到 hProcess 进程终止
     WaitForSingleObject(hProcess, INFINITE);
-
-    // 进程终止后，检查 g_isExiting 标志
-    // 如果不是用户主动退出（g_isExiting == FALSE），则向主窗口发送崩溃消息
     if (!g_isExiting) {
         PostMessageW(hwnd, WM_SINGBOX_CRASHED, 0, 0);
     }
-
     return 0;
 }
 
-// 监视 sing-box 核心进程日志输出的线程函数
 DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
-    char readBuf[4096];      // 原始读取缓冲区
-    char lineBuf[8192] = {0}; // 拼接缓冲区，处理跨Read的日志行
+    char readBuf[4096];
+    char lineBuf[8192] = {0};
     DWORD dwRead;
     BOOL bSuccess;
     static time_t lastLogTriggeredRestart = 0;
-    const time_t RESTART_COOLDOWN = 60; // 60秒日志触发冷却
+    const time_t RESTART_COOLDOWN = 60;
     HANDLE hPipe = (HANDLE)lpParam;
 
     while (TRUE) {
-        // 从管道读取数据
         bSuccess = ReadFile(hPipe, readBuf, sizeof(readBuf) - 1, &dwRead, NULL);
-        
         if (!bSuccess || dwRead == 0) {
-            // 管道被破坏或关闭 (例如，sing-box 被终止)
-            break; // 线程退出
+            break;
         }
-
-        // 确保缓冲区以NULL结尾
         readBuf[dwRead] = '\0';
-
-        // --- 新增：转发日志到查看器窗口 ---
         if (hLogViewerWnd != NULL && !g_isExiting) {
             int wideLen = MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, NULL, 0);
             if (wideLen > 0) {
-                // 为 wchar_t* 分配内存
                 wchar_t* pWideBuf = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
                 if (pWideBuf) {
                     MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, pWideBuf, wideLen);
-                    
-                    // 异步发送消息，将内存指针作为lParam传递
-                    // 日志窗口的UI线程将负责 free(pWideBuf)
                     if (!PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)pWideBuf)) {
-                        // 如果PostMessage失败（例如窗口正在关闭），我们必须在这里释放内存
                         free(pWideBuf);
                     }
                 }
             }
         }
-        // --- 新增结束 ---
-
-
-        // 将新读取的数据附加到行缓冲区
         strncat(lineBuf, readBuf, sizeof(lineBuf) - strlen(lineBuf) - 1);
-
-        // 如果我们正在退出或切换，不要解析日志
         if (g_isExiting) {
             continue;
         }
-
-        // --- 关键词分析 ---
-        // 查找可能需要重启的严重错误
         char* fatal_pos = strstr(lineBuf, "level\"=\"fatal");
         char* dial_pos = strstr(lineBuf, "failed to dial");
-
-        // (--- 已修改 ---) 仅检测 fatal 和 dial 错误
         if (fatal_pos != NULL || dial_pos != NULL) {
             time_t now = time(NULL);
             if (now - lastLogTriggeredRestart > RESTART_COOLDOWN) {
                 lastLogTriggeredRestart = now;
-                // 发送消息 (WndProc 将处理此消息以进行提示)
                 PostMessageW(hwnd, WM_SINGBOX_RECONNECT, 0, 0);
             }
-            // 处理完错误后，清空缓冲区，防止重复触发
             lineBuf[0] = '\0';
         } else {
-            // 如果没有找到错误，我们需要清理缓冲区，只保留最后一行（可能是半行）
             char* last_newline = strrchr(lineBuf, '\n');
             if (last_newline != NULL) {
-                // 找到了换行符，只保留换行符之后的内容
                 strcpy(lineBuf, last_newline + 1);
             } else if (strlen(lineBuf) > 4096) {
-                // 缓冲区已满但没有换行符（异常情况），清空它以防溢出
                 lineBuf[0] = '\0';
             }
-            // 如果没有换行符且缓冲区未满，则不执行任何操作，等待下一次 ReadFile 拼接
         }
     }
-    
     return 0;
 }
-// --- 重构结束 ---
 
-
-// --- 重构：修改 StartSingBox ---
 void StartSingBox() {
-    HANDLE hPipe_Rd_Local = NULL; // 管道读取端（本地）
-    HANDLE hPipe_Wr_Local = NULL; // 管道写入端（本地）
+    HANDLE hPipe_Rd_Local = NULL;
+    HANDLE hPipe_Wr_Local = NULL;
     SECURITY_ATTRIBUTES sa;
 
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
     sa.lpSecurityDescriptor = NULL;
 
-    // 创建用于 stdout/stderr 的管道
     if (!CreatePipe(&hPipe_Rd_Local, &hPipe_Wr_Local, &sa, 0)) {
         ShowError(L"管道创建失败", L"无法为核心程序创建输出管道。");
         return;
     }
-    // 确保管道的读取句柄不能被子进程继承
     if (!SetHandleInformation(hPipe_Rd_Local, HANDLE_FLAG_INHERIT, 0)) {
         ShowError(L"管道句柄属性设置失败", L"无法设置输出管道读取句柄的属性。");
         CloseHandle(hPipe_Rd_Local);
@@ -643,9 +530,7 @@ void StartSingBox() {
         return;
     }
 
-    // 将本地读取句柄保存到全局变量，以便日志线程使用
     hChildStd_OUT_Rd_Global = hPipe_Rd_Local;
-
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     si.wShowWindow = SW_HIDE;
@@ -659,46 +544,32 @@ void StartSingBox() {
     if (!CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         ShowError(L"核心程序启动失败", L"无法创建 sing-box.exe 进程。");
         ZeroMemory(&pi, sizeof(pi));
-        CloseHandle(hChildStd_OUT_Rd_Global); // 清理全局句柄
+        CloseHandle(hChildStd_OUT_Rd_Global);
         hChildStd_OUT_Rd_Global = NULL;
         CloseHandle(hPipe_Wr_Local);
         return;
     }
 
-    // 子进程已继承写入句柄，我们不再需要它
     CloseHandle(hPipe_Wr_Local);
-
-    // 检查核心是否在500ms内立即退出（通常是配置错误）
     if (WaitForSingleObject(pi.hProcess, 500) == WAIT_OBJECT_0) {
         char chBuf[4096] = {0};
         DWORD dwRead = 0;
         wchar_t errorOutput[4096] = L"";
-
-        // 从管道读取初始错误输出
         if (ReadFile(hChildStd_OUT_Rd_Global, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
             chBuf[dwRead] = '\0';
             MultiByteToWideChar(CP_UTF8, 0, chBuf, -1, errorOutput, ARRAYSIZE(errorOutput));
         }
-
         wchar_t fullMessage[8192];
         wsprintfW(fullMessage, L"sing-box.exe 核心程序启动后立即退出。\n\n可能的原因:\n- 配置文件(config.json)格式错误\n- 核心文件损坏或不兼容\n\n核心程序输出:\n%s", errorOutput);
         ShowError(L"核心程序启动失败", fullMessage);
-        
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         ZeroMemory(&pi, sizeof(pi));
-        
-        CloseHandle(hChildStd_OUT_Rd_Global); // 清理管道
+        CloseHandle(hChildStd_OUT_Rd_Global);
         hChildStd_OUT_Rd_Global = NULL;
     } 
     else {
-        // --- 进程启动成功，启动监控线程 ---
-
-        // 1. 启动崩溃监控线程
         hMonitorThread = CreateThread(NULL, 0, MonitorThread, pi.hProcess, 0, NULL);
-        
-        // 2. 启动日志监控线程
-        // 我们必须复制管道句柄，因为 LogMonitorThread 会在退出时关闭它
         HANDLE hPipeForLogThread;
         if (DuplicateHandle(GetCurrentProcess(), hChildStd_OUT_Rd_Global,
                            GetCurrentProcess(), &hPipeForLogThread, 0,
@@ -706,24 +577,16 @@ void StartSingBox() {
         {
             hLogMonitorThread = CreateThread(NULL, 0, LogMonitorThread, hPipeForLogThread, 0, NULL);
         }
-        // --- 监控启动完毕 ---
     }
-
-    // 注意：我们 *不* 在这里关闭 hChildStd_OUT_Rd_Global
-    // 它由 StopSingBox 统一关闭
 }
-// --- 重构结束 ---
+
 void SwitchNode(const wchar_t* tag) {
     SafeReplaceOutbound(tag);
     wcsncpy(currentNode, tag, ARRAYSIZE(currentNode) - 1);
     currentNode[ARRAYSIZE(currentNode)-1] = L'\0';
-    
-    // --- 重构：添加退出标志 ---
-    g_isExiting = TRUE; // 标记为主动操作，防止监控线程误报
+    g_isExiting = TRUE;
     StopSingBox();
-    g_isExiting = FALSE; // 清除标志，准备重启
-    // --- 重构结束 ---
-
+    g_isExiting = FALSE;
     StartSingBox();
     wchar_t message[256];
     wsprintfW(message, L"当前节点: %s", tag);
@@ -732,19 +595,13 @@ void SwitchNode(const wchar_t* tag) {
 
 void SetSystemProxy(BOOL enable) {
     int hPort = GetHttpInboundPort();
-    int sPort = GetSocksInboundPort(); // (--- 新增 ---)
-
-    if (hPort == 0 && sPort == 0 && enable) { // (--- 修改：两者都为0才报错 ---)
+    int sPort = GetSocksInboundPort();
+    if (hPort == 0 && sPort == 0 && enable) {
         MessageBoxW(NULL, L"未找到 HTTP 或 SOCKS (或 Mixed) 入站端口，无法设置系统代理。", L"错误", MB_OK | MB_ICONERROR);
         return;
     }
-
-    // (--- 智能代理修改：重构以支持 Win8+ (注册表) 和 Win7 (InternetSetOption) ---)
-    // (--- 统一使用 "http=...;socks=..." 格式写入 ProxyServer 字段 ---)
-
     wchar_t proxyServerString[256] = {0};
     wchar_t proxyBypassString[64] = {0};
-
     if (enable) {
         if (hPort > 0) {
             wchar_t httpBuf[128];
@@ -754,48 +611,39 @@ void SetSystemProxy(BOOL enable) {
         if (sPort > 0) {
             wchar_t socksBuf[128];
             wsprintfW(socksBuf, L"socks=127.0.0.1:%d", sPort);
-            if (proxyServerString[0] != L'\0') { // 如果已有HTTP, 添加分号
+            if (proxyServerString[0] != L'\0') {
                 wcsncat(proxyServerString, L";", ARRAYSIZE(proxyServerString) - wcslen(proxyServerString) - 1);
             }
             wcsncat(proxyServerString, socksBuf, ARRAYSIZE(proxyServerString) - wcslen(proxyServerString) - 1);
         }
         wcsncpy(proxyBypassString, L"<local>", ARRAYSIZE(proxyBypassString) - 1);
     }
-    
-    // (--- Win8+ (及更高版本) 使用注册表 ---)
     if (IsWindows8OrGreater()) {
         HKEY hKey;
         if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
             ShowError(L"代理设置失败", L"无法打开注册表键。");
             return;
         }
-
         if (enable) {
             DWORD dwEnable = 1;
             RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
             RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
             RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
-            
-            // (--- 清理旧的独立 SOCKS 键 (如果存在) ---)
             RegDeleteValueW(hKey, L"SocksProxyServer"); 
         } else {
             DWORD dwEnable = 0;
             RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t)); // 清空
-            RegDeleteValueW(hKey, L"SocksProxyServer"); // 清空
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
+            RegDeleteValueW(hKey, L"SocksProxyServer");
         }
         RegCloseKey(hKey);
-    } 
-    // (--- 旧版 Windows (Win 7) 使用 InternetSetOptionW ---)
-    else {
+    } else {
         INTERNET_PER_CONN_OPTION_LISTW list;
         INTERNET_PER_CONN_OPTIONW options[3];
         DWORD dwBufSize = sizeof(list);
-        
         options[0].dwOption = INTERNET_PER_CONN_FLAGS;
         options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
         options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
-        
         if (enable) {
             options[0].Value.dwValue = PROXY_TYPE_PROXY;
             options[1].Value.pszValue = proxyServerString;
@@ -805,19 +653,16 @@ void SetSystemProxy(BOOL enable) {
             options[1].Value.pszValue = L"";
             options[2].Value.pszValue = L"";
         }
-        
         list.dwSize = sizeof(list);
         list.pszConnection = NULL;
         list.dwOptionCount = 3;
         list.dwOptionError = 0;
         list.pOptions = options;
-        
         if (!InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize)) {
             ShowError(L"代理设置失败", L"调用 InternetSetOptionW 失败。");
             return;
         }
     }
-
     InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
     InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
@@ -826,65 +671,43 @@ BOOL IsSystemProxyEnabled() {
     HKEY hKey;
     DWORD dwEnable = 0;
     DWORD dwSize = sizeof(dwEnable);
-    wchar_t proxyServer[1024] = {0}; // (--- 增大缓冲区以容纳组合字符串 ---)
+    wchar_t proxyServer[1024] = {0};
     DWORD dwProxySize = sizeof(proxyServer);
-    
     int hPort = GetHttpInboundPort();
-    int sPort = GetSocksInboundPort(); // (--- 新增 ---)
-    
+    int sPort = GetSocksInboundPort();
     BOOL isEnabled = FALSE;
-    
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
             if (dwEnable == 1) {
-                // (--- 修改：检查 HTTP 或 SOCKS 端口 ---)
-                
                 if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
-                    
                     BOOL httpMatch = FALSE;
                     BOOL socksMatch = FALSE;
-                    
                     if (hPort > 0) {
                         wchar_t expectedHttp[128];
-                        // 检查 "http=..." 格式
                         wsprintfW(expectedHttp, L"http=127.0.0.1:%d", hPort);
                         if (wcsstr(proxyServer, expectedHttp) != NULL) {
                             httpMatch = TRUE;
                         } else {
-                            // 兼容旧的或仅 HTTP 的设置 (例如 "127.0.0.1:10809")
                             wchar_t expectedHttpLegacy[64];
                             wsprintfW(expectedHttpLegacy, L"127.0.0.1:%d", hPort);
-                            // 必须完全匹配 (防止 "127.0.0.1:1080" 匹配 "127.0.0.1:10809")
                             if (wcscmp(proxyServer, expectedHttpLegacy) == 0) {
                                 httpMatch = TRUE;
                             }
                         }
                     }
-                    
                     if (sPort > 0) {
                          wchar_t expectedSocks[128];
-                         // 检查 "socks=..." 格式
                          wsprintfW(expectedSocks, L"socks=127.0.0.1:%d", sPort);
                          if (wcsstr(proxyServer, expectedSocks) != NULL) {
                             socksMatch = TRUE;
                          }
                     }
-                    
-                    // (--- 智能检测逻辑 ---)
                     if (hPort > 0 && sPort > 0 && hPort == sPort) {
-                        // (--- Mixed 端口: hPort 和 sPort 相同 ---)
-                        // 只要 http 或 socks 任一匹配即可
                         if (httpMatch || socksMatch) isEnabled = TRUE;
                     } 
                     else {
-                        // (--- 独立端口 ---)
-                        // 我们期望的端口必须被匹配
-                        if (hPort > 0 && httpMatch) {
-                            isEnabled = TRUE;
-                        }
-                        if (sPort > 0 && socksMatch) {
-                            isEnabled = TRUE;
-                        }
+                        if (hPort > 0 && httpMatch) isEnabled = TRUE;
+                        if (sPort > 0 && socksMatch) isEnabled = TRUE;
                     }
                 }
             }
@@ -894,9 +717,6 @@ BOOL IsSystemProxyEnabled() {
     return isEnabled;
 }
 
-// =========================================================================
-// (已修改) 安全地修改 config.json 中的路由 (修改 route.final)
-// =========================================================================
 void SafeReplaceOutbound(const wchar_t* newTag) {
     char* buffer = NULL;
     long size = 0;
@@ -917,24 +737,16 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
         free(newTagMb);
         return;
     }
-
-    // (--- 已修改 ---)
     cJSON* route = cJSON_GetObjectItem(root, "route");
     if (route) {
-        // (--- 新逻辑 ---)
-        // 直接修改 route.final
         cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
         if (final_outbound) {
             cJSON_SetValuestring(final_outbound, newTagMb);
         } else {
-            // (--- 备用逻辑 ---)
-            // 如果 "final" 字段不存在，则创建它
             cJSON_AddItemToObject(route, "final", cJSON_CreateString(newTagMb));
         }
     }
-
     char* newContent = cJSON_PrintBuffered(root, 1, 1);
-
     if (newContent) {
         FILE* out = NULL;
         if (_wfopen_s(&out, L"config.json", L"wb") == 0 && out != NULL) {
@@ -948,10 +760,6 @@ void SafeReplaceOutbound(const wchar_t* newTag) {
     free(newTagMb);
 }
 
-// =========================================================================
-// (--- 已修改：移除混合逻辑，菜单项始终可用 ---)
-// (--- 已修改：移除“节点转换” ---)
-// =========================================================================
 void UpdateMenu() {
     if (hMenu) DestroyMenu(hMenu);
     if (hNodeSubMenu) DestroyMenu(hNodeSubMenu);
@@ -963,35 +771,27 @@ void UpdateMenu() {
         AppendMenuW(hNodeSubMenu, flags, ID_TRAY_NODE_BASE + i, nodeTags[i]);
     }
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNodeSubMenu, L"切换节点");
-
-    // (--- 已修改：节点管理始终可用 ---)
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MANAGE_NODES, L"管理节点");
-    // (--- “节点转换” 菜单项及其分隔符已移除 ---)
-    
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_AUTORUN, L"开机启动");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SYSTEM_PROXY, L"系统代理");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"隐藏图标");
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"显示日志"); // 新增
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"显示日志");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
 }
-// --- 重构结束 ---
 
-
-// --- 重构：修改 WndProc (移除自动切换节点) ---
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // 自动重启的冷却计时器
     static time_t lastAutoRestart = 0;
-    const time_t RESTART_COOLDOWN = 60; // 60秒 (保留定义，用于崩溃提示)
+    const time_t RESTART_COOLDOWN = 60;
 
     if (msg == WM_TRAY && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)) {
         POINT pt;
         GetCursorPos(&pt);
         SetForegroundWindow(hWnd);
         ParseTags();
-        UpdateMenu(); // (--- UpdateMenu 现在始终启用所有菜单 ---)
+        UpdateMenu();
         CheckMenuItem(hMenu, ID_TRAY_AUTORUN, IsAutorunEnabled() ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, ID_TRAY_SYSTEM_PROXY, IsSystemProxyEnabled() ? MF_CHECKED : MF_UNCHECKED);
         TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hWnd, NULL);
@@ -1000,15 +800,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     else if (msg == WM_COMMAND) {
         int id = LOWORD(wParam);
         if (id == ID_TRAY_EXIT) {
-            
-            g_isExiting = TRUE; // 标记为主动退出
-
-            // --- 新增：销毁日志窗口 ---
+            g_isExiting = TRUE;
             if (hLogViewerWnd != NULL) {
                 DestroyWindow(hLogViewerWnd);
             }
-            // --- 新增结束 ---
-
             UnregisterHotKey(hWnd, ID_GLOBAL_HOTKEY);
             if(g_isIconVisible) Shell_NotifyIconW(NIM_DELETE, &nid);
             if (IsSystemProxyEnabled()) SetSystemProxy(FALSE);
@@ -1021,13 +816,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             BOOL isEnabled = IsSystemProxyEnabled();
             SetSystemProxy(!isEnabled);
             ShowTrayTip(L"系统代理", isEnabled ? L"系统代理已关闭" : L"系统代理已开启");
-        // (--- 移除 ID_TRAY_OPEN_CONVERTER 的处理 ---)
         } else if (id == ID_TRAY_SETTINGS) {
             OpenSettingsWindow();
         } else if (id == ID_TRAY_MANAGE_NODES) {
-             // (--- 保留文件1的功能 ---)
             OpenNodeManagerWindow();
-        } else if (id == ID_TRAY_SHOW_CONSOLE) { // --- 新增：处理日志窗口 ---
+        } else if (id == ID_TRAY_SHOW_CONSOLE) {
             OpenLogViewerWindow();
         } else if (id >= ID_TRAY_NODE_BASE && id < ID_TRAY_NODE_BASE + nodeCount) {
             SwitchNode(nodeTags[id - ID_TRAY_NODE_BASE]);
@@ -1037,70 +830,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleTrayIconVisibility();
         }
     }
-    // --- 重构：处理核心崩溃或日志错误 (移除自动切换) ---
     else if (msg == WM_SINGBOX_CRASHED) {
-        // 核心崩溃，只提示，不自动操作
         ShowTrayTip(L"Sing-box 监控", L"核心进程意外终止。请手动检查。");
     }
     else if (msg == WM_SINGBOX_RECONNECT) {
-        // (--- 已修改 ---) 
-        // 日志检测到错误 (fatal, dial failed)，不再执行自动切换，只进行提示。
-        
-        // 冷却计时器 (用于提示，防止刷屏)
         static time_t lastErrorNotify = 0; 
-        const time_t NOTIFY_COOLDOWN = 60; // 60秒冷却
+        const time_t NOTIFY_COOLDOWN = 60;
         time_t now = time(NULL);
-
         if (now - lastErrorNotify > NOTIFY_COOLDOWN) {
-            lastErrorNotify = now; // 更新提示时间戳
+            lastErrorNotify = now;
             ShowTrayTip(L"Sing-box 监控", L"检测到核心日志严重错误 (fatal 或 dial failed)。");
         }
-        // (--- 移除所有切换逻辑 ---)
     }
-    // (--- 新增：处理初始化完成消息 ---)
     else if (msg == WM_INIT_COMPLETE) {
-        BOOL success = (BOOL)wParam; // (--- 修正：成功标志在 wParam 中 ---)
+        BOOL success = (BOOL)wParam;
         if (success) {
-            // 启动成功
-            // 此时 InitThread 中的 ParseTags 已经确保 nodeTags 和 currentNode 是最新的
-            // (--- 优化：我们可以在此再次调用 ParseTags() 以确保菜单数据绝对同步 ---)
             ParseTags();
-            
-            // 更新托盘提示
             wcsncpy(nid.szTip, L"程序正在运行...", ARRAYSIZE(nid.szTip) - 1);
             if(g_isIconVisible) { Shell_NotifyIconW(NIM_MODIFY, &nid); }
-            
             ShowTrayTip(L"启动成功", L"程序已准备就绪。");
-
         } else {
-            // 启动失败，InitThread 已经显示了错误 MessageBox
             ShowTrayTip(L"启动失败", L"核心初始化失败，程序将退出。");
-            
-            // 发送退出消息关闭程序
             PostMessageW(hWnd, WM_COMMAND, ID_TRAY_EXIT, 0);
         }
     }
-    // (--- 新增：处理后台线程的气泡提示 ---)
     else if (msg == WM_SHOW_TRAY_TIP) {
         wchar_t* pTitle = (wchar_t*)wParam;
         wchar_t* pMessage = (wchar_t*)lParam;
         if (pTitle && pMessage) {
             ShowTrayTip(pTitle, pMessage);
-            // 释放由 PostTrayTip 分配的内存
             free(pTitle);
             free(pMessage);
         }
     }
-    // --- 重构结束 ---
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
-// --- 重构结束 ---
-// --- 重构：修改 StopSingBox ---
-void StopSingBox() {
-    // 标记为正在退出，让监控线程自行终止
-    g_isExiting = TRUE; 
 
-    // 1. 停止核心进程
+void StopSingBox() {
+    g_isExiting = TRUE; 
     if (pi.hProcess) {
         DWORD exitCode = 0;
         GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -1111,34 +878,22 @@ void StopSingBox() {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
-    
-    // 2. 终止并清理崩溃监控线程
     if (hMonitorThread) {
-        // 进程终止后，此线程会很快退出
         WaitForSingleObject(hMonitorThread, 1000);
         CloseHandle(hMonitorThread);
     }
-
-    // 3. 终止并清理日志监控线程
     if (hChildStd_OUT_Rd_Global) {
-        // 关闭管道的读取端，这将导致 LogMonitorThread 中的 ReadFile 失败
         CloseHandle(hChildStd_OUT_Rd_Global);
     }
     if (hLogMonitorThread) {
-        // 等待日志线程安全退出
         WaitForSingleObject(hLogMonitorThread, 1000);
         CloseHandle(hLogMonitorThread);
     }
-
-    // 4. 重置所有全局句柄
     ZeroMemory(&pi, sizeof(pi));
     hMonitorThread = NULL;
     hLogMonitorThread = NULL;
     hChildStd_OUT_Rd_Global = NULL;
-    
-    // g_isExiting 会在 StartSingBox 或程序退出前被重置
 }
-// --- 重构结束 ---
 
 void SetAutorun(BOOL enable) {
     HKEY hKey;
@@ -1169,13 +924,7 @@ BOOL IsAutorunEnabled() {
     return FALSE;
 }
 
-// =========================================================================
-// (已修改) 生成默认配置文件 (匹配 route.final 逻辑)
-// (--- 已修改：使用用户提供的 config.json 作为模板 ---)
-// =========================================================================
 void CreateDefaultConfig() {
-    // (--- 已修改 ---)
-    // 使用用户提供的 config.json 内容作为默认配置
     const char* defaultConfig =
         "{\n"
         "\t\"log\": {\n"
@@ -1289,16 +1038,13 @@ void CreateDefaultConfig() {
         fclose(f);
         MessageBoxW(NULL,
             L"未找到 config.json，已为您生成默认配置文件。\n\n"
-            L"请在使用前修改 config.json 中的 'xxx' 节点信息。", // (--- 已修改提示 ---)
+            L"请在使用前修改 config.json 中的 'xxx' 节点信息。", 
             L"提示", MB_OK | MB_ICONINFORMATION);
     } else {
         MessageBoxW(NULL, L"无法创建默认的 config.json 文件。", L"错误", MB_OK | MB_ICONERROR);
     }
 }
 
-// =========================================================================
-// (--- 新增：辅助函数，将内存缓冲区写入文件 ---)
-// =========================================================================
 BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSize) {
     if (!buffer || fileSize <= 0) {
         return FALSE;
@@ -1312,154 +1058,102 @@ BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSi
     return (written == fileSize);
 }
 
-// =========================================================================
-// (--- 新增：实现跨磁盘驱动器的文件移动 ---)
-// =========================================================================
 BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName) {
-    // 1. 优先尝试快速移动 (同盘符)
     if (MoveFileExW(lpExistingFileName, lpNewFileName, MOVEFILE_REPLACE_EXISTING)) {
         return TRUE;
     }
-
-    // 2. 检查是否为 "跨盘符" 错误
     if (GetLastError() == ERROR_NOT_SAME_DEVICE) {
-        // 3. 备用方案：复制 和 删除
         char* buffer = NULL;
         long size = 0;
-
-        // 3a. 读取源文件 (临时文件)
         if (!ReadFileToBuffer(lpExistingFileName, &buffer, &size) || size == 0) {
             if (buffer) free(buffer);
-            return FALSE; // 无法读取源文件
+            return FALSE;
         }
-
-        // 3b. 写入目标文件 (config.json)
         BOOL writeSuccess = WriteBufferToFileW(lpNewFileName, buffer, size);
         free(buffer);
-
         if (!writeSuccess) {
-            return FALSE; // 无法写入目标文件
+            return FALSE;
         }
-
-        // 3c. 删除源文件 (临时文件)
         DeleteFileW(lpExistingFileName);
-        return TRUE; // 跨卷移动成功
+        return TRUE;
     }
-
-    // 4. 其他未知错误
     return FALSE;
 }
 
-// =========================================================================
-// (--- 新增：辅助函数，用于后台线程安全地发送气泡提示 ---)
-// =========================================================================
 void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message) {
     size_t titleLen = wcslen(title) + 1;
     size_t msgLen = wcslen(message) + 1;
     wchar_t* pTitle = (wchar_t*)malloc(titleLen * sizeof(wchar_t));
     wchar_t* pMessage = (wchar_t*)malloc(msgLen * sizeof(wchar_t));
-
     if (!pTitle || !pMessage) {
         if (pTitle) free(pTitle);
         if (pMessage) free(pMessage);
         return;
     }
-    
-    // 复制字符串
     wcsncpy(pTitle, title, titleLen);
     pTitle[titleLen - 1] = L'\0';
     wcsncpy(pMessage, message, msgLen);
     pMessage[msgLen - 1] = L'\0';
-
-    // 异步发送消息，将内存指针作为参数传递
-    // 主窗口的 WndProc (WM_SHOW_TRAY_TIP) 将负责 free() 它们
     if (!PostMessageW(hWndMain, WM_SHOW_TRAY_TIP, (WPARAM)pTitle, (LPARAM)pMessage)) {
-        // 如果 PostMessage 失败 (例如主窗口已销毁)，我们必须在这里释放内存
         free(pTitle);
         free(pMessage);
     }
 }
-
-
-// =========================================================================
-// (--- 新增：从文件2集成的下载功能 ---)
-// (--- 已修正：使用绝对路径启动 curl.exe ---)
-// (--- 已修改：移除弹窗，改用 PostTrayTip ---)
-// =========================================================================
-BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) { // (--- 修改：增加 hWndMain 参数 ---)
-    wchar_t cmdLine[4096]; // (--- 缓冲区增大以容纳更长的URL ---)
+BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) {
+    wchar_t cmdLine[4096];
     wchar_t fullSavePath[MAX_PATH];
     wchar_t fullCurlPath[MAX_PATH];
     wchar_t moduleDir[MAX_PATH];
+    BOOL useSystemCurl = FALSE;
 
-    // 1. 获取程序 .exe 所在的目录
     GetModuleFileNameW(NULL, moduleDir, MAX_PATH);
     wchar_t* p = wcsrchr(moduleDir, L'\\');
-    if (p) {
-        *p = L'\0'; // 截断文件名，只保留目录
-    } else {
-        // 无法获取目录，使用当前目录
-        wcsncpy(moduleDir, L".", MAX_PATH);
-    }
+    if (p) *p = L'\0'; else wcsncpy(moduleDir, L".", MAX_PATH);
 
-    // 2. 构建 curl.exe 的绝对路径
     wsprintfW(fullCurlPath, L"%s\\curl.exe", moduleDir);
-
-    // 3. 检查 curl.exe 是否真的存在
     DWORD fileAttr = GetFileAttributesW(fullCurlPath);
     if (fileAttr == INVALID_FILE_ATTRIBUTES || (fileAttr & FILE_ATTRIBUTE_DIRECTORY)) {
-         wchar_t errorMsg[MAX_PATH + 256];
-         wsprintfW(errorMsg, L"启动失败：未找到 curl.exe。\n\n"
-                            L"请确保 curl.exe 位于此路径：\n%s",
-                            fullCurlPath);
-         MessageBoxW(NULL, errorMsg, L"文件缺失", MB_OK | MB_ICONERROR);
-        return FALSE;
+        useSystemCurl = TRUE;
+        wcsncpy(fullCurlPath, L"curl", MAX_PATH);
     }
 
-    // 4. 获取 savePath 的绝对路径
-    // (--- 优化：savePath 现在可能是临时路径，GetFullPathName 仍然适用 ---)
     if (GetFullPathNameW(savePath, MAX_PATH, fullSavePath, NULL) == 0) {
-        ShowError(L"下载失败", L"无法获取配置文件的绝对路径。");
+        PostTrayTip(hWndMain, L"路径错误", L"无法获取保存路径。");
         return FALSE;
     }
 
-    // 5. 构造 curl.exe 命令
-    // -k 允许不安全的 SSL 连接 (跳过证书验证)
-    // -L 跟随重定向
-    // -sS 静默但显示错误
-    // -o 输出文件
-    wsprintfW(cmdLine, 
-        L"\"%s\" -ksSL -o \"%s\" \"%s\"", // 注意：不再需要 cmd.exe /C
-        fullCurlPath, fullSavePath, url
-    );
+    const wchar_t* userAgent = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    
+    if (useSystemCurl) {
+        wsprintfW(cmdLine, 
+            L"curl -ksSL -A \"%s\" --connect-timeout 10 --max-time 30 -o \"%s\" \"%s\"", 
+            userAgent, fullSavePath, url
+        );
+    } else {
+        wsprintfW(cmdLine, 
+            L"\"%s\" -ksSL -A \"%s\" --connect-timeout 10 --max-time 30 -o \"%s\" \"%s\"", 
+            fullCurlPath, userAgent, fullSavePath, url
+        );
+    }
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION downloaderPi = {0};
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE; // 隐藏 cmd 窗口
+    si.wShowWindow = SW_HIDE;
 
-    // 6. 直接执行 curl.exe，并将工作目录设置为 .exe 所在目录
-    if (!CreateProcessW(NULL,           // lpApplicationName (use cmdLine)
-                        cmdLine,        // lpCommandLine (必须是可修改的)
-                        NULL,           // lpProcessAttributes
-                        NULL,           // lpThreadAttributes
-                        FALSE,          // bInheritHandles
-                        CREATE_NO_WINDOW, // dwCreationFlags
-                        NULL,           // lpEnvironment
-                        moduleDir,      // lpCurrentDirectory (在 .exe 所在目录运行)
-                        &si,            // lpStartupInfo
-                        &downloaderPi)) // lpProcessInformation
-    {
-        ShowError(L"下载失败", L"无法启动 curl.exe 下载进程 (CreateProcessW)。");
+    if (!CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, moduleDir, &si, &downloaderPi)) {
+        if (useSystemCurl) {
+            PostTrayTip(hWndMain, L"下载组件缺失", L"未找到 curl.exe。请下载 curl.exe 放入程序目录，或更新 Windows 系统。");
+        } else {
+            PostTrayTip(hWndMain, L"启动失败", L"无法启动 curl 进程。");
+        }
         return FALSE;
     }
 
-    // 7. 等待下载进程完成 (最多30秒)
-    DWORD waitResult = WaitForSingleObject(downloaderPi.hProcess, 30000); 
+    DWORD waitResult = WaitForSingleObject(downloaderPi.hProcess, 35000); 
 
     if (waitResult == WAIT_TIMEOUT) {
-        // (--- 修改：ShowError -> PostTrayTip ---)
-        PostTrayTip(hWndMain, L"下载失败", L"curl.exe 下载超时 (30秒)。");
+        PostTrayTip(hWndMain, L"下载超时", L"连接服务器超时，请检查网络或 URL。");
         TerminateProcess(downloaderPi.hProcess, 1);
         CloseHandle(downloaderPi.hProcess);
         CloseHandle(downloaderPi.hThread);
@@ -1468,43 +1162,32 @@ BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) 
 
     DWORD exitCode = 1;
     GetExitCodeProcess(downloaderPi.hProcess, &exitCode);
-    
     CloseHandle(downloaderPi.hProcess);
     CloseHandle(downloaderPi.hThread);
 
     if (exitCode != 0) {
-        wchar_t errorMsg[512];
-        wsprintfW(errorMsg, L"curl.exe 报告了错误 (退出码 %lu)。\n请检查网络或 URL 是否正确。", exitCode);
-        // (--- 修改：ShowError -> PostTrayTip ---)
-        PostTrayTip(hWndMain, L"下载失败", errorMsg);
+        wchar_t errorMsg[128];
+        wsprintfW(errorMsg, L"下载失败 (代码: %lu)。请检查 URL 是否有效。", exitCode);
+        PostTrayTip(hWndMain, L"下载错误", errorMsg);
         return FALSE;
     }
 
-    // 8. 检查文件是否真的被下载了
     long fileSize = 0;
     char* fileBuffer = NULL;
-    // (--- 优化：savePath 现在可能是临时路径，ReadFileToBuffer 仍然适用 ---)
     if (ReadFileToBuffer(savePath, &fileBuffer, &fileSize)) {
-        if (fileSize < 50) { // 假设一个有效的 JSON 配置至少大于 50 字节
-             // (--- 修改：ShowError -> PostTrayTip ---)
-             PostTrayTip(hWndMain, L"下载失败", L"下载的文件过小 (小于 50 字节)。\n"
-                                   L"这可能是一个错误页面，请检查 URL 是否为[原始]链接。");
+        if (fileSize < 50) {
+             PostTrayTip(hWndMain, L"下载失败", L"下载的内容无效 (空白或过短)。可能链接已过期。");
              free(fileBuffer);
-             DeleteFileW(savePath); // (--- 新增 ---) 删除无效的tmp文件
+             DeleteFileW(savePath);
              return FALSE;
         }
         free(fileBuffer);
-        // 文件存在且大小不为0，视为成功
         return TRUE; 
-    } else {
-        ShowError(L"下载失败", L"curl.exe 报告成功，但无法读取下载的配置文件。");
-        return FALSE;
     }
+
+    return FALSE;
 }
-// =========================================================================
-// 节点管理功能实现 (文件1 保留功能)
-// =========================================================================
-// 刷新节点管理窗口中的列表框
+
 void RefreshNodeListBox(HWND hListBox) {
     SendMessageW(hListBox, LB_RESETCONTENT, 0, 0);
     for (int i = 0; i < nodeCount; i++) {
@@ -1512,7 +1195,6 @@ void RefreshNodeListBox(HWND hListBox) {
     }
 }
 
-// 打开节点管理窗口
 void OpenNodeManagerWindow() {
     const wchar_t* MANAGER_CLASS_NAME = L"SingboxNodeManagerClass";
     WNDCLASSW wc = {0};
@@ -1537,13 +1219,11 @@ void OpenNodeManagerWindow() {
     }
 }
 
-// 节点管理窗口的过程函数
 LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hListBox, hModifyBtn, hDeleteBtn, hAddBtn, hInfoLabel;
 
     switch (msg) {
         case WM_CREATE: {
-            // 使用 LBS_EXTENDEDSEL 样式以支持多选
             hListBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_EXTENDEDSEL | LBS_NOTIFY, 10, 10, 260, 240, hWnd, (HMENU)ID_NODEMGR_LISTBOX, NULL, NULL);
             hAddBtn = CreateWindowW(L"BUTTON", L"添加节点", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 280, 10, 120, 30, hWnd, (HMENU)ID_NODEMGR_ADD_BTN, NULL, NULL);
             hModifyBtn = CreateWindowW(L"BUTTON", L"修改节点", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 280, 50, 120, 30, hWnd, (HMENU)ID_NODEMGR_MODIFY_BTN, NULL, NULL);
@@ -1571,7 +1251,6 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_PIN_NODE, L"置顶节点");
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_SORT_NODES, L"节点排序");
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_DEDUPLICATE, L"节点去重 (内容)");
-                // 移除了 "修复重复标签" 菜单项 (已改为启动时自动修复)
                 AppendMenuW(hContextMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_SELECT_ALL, L"全部选择");
                 AppendMenuW(hContextMenu, MF_STRING, ID_NODEMGR_CONTEXT_DESELECT_ALL, L"全部取消");
@@ -1623,7 +1302,6 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     }
                     break;
                 }
-                
                 case ID_NODEMGR_CONTEXT_SELECT_ALL:
                     SendMessage(hListBox, LB_SETSEL, TRUE, -1);
                     break;
@@ -1702,13 +1380,10 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
                         if (wasCurrentNode) {
                             MessageBoxW(hWnd, L"检测到当前活动节点已被修改，核心将自动重启以应用更改。", L"提示", MB_OK | MB_ICONINFORMATION);
-                            
-                            // --- 重构：使用安全重启 ---
                             g_isExiting = TRUE;
                             StopSingBox();
                             g_isExiting = FALSE;
                             StartSingBox();
-                            // --- 重构结束 ---
                         }
                     }
                     EnableWindow(hWnd, TRUE);
@@ -1744,19 +1419,16 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     wsprintfW(confirmMsg, L"您确定要删除选中的 %d 个节点吗？\n此操作不可恢复。", selCount);
                     if (MessageBoxW(hWnd, confirmMsg, L"确认删除", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                         BOOL allSucceeded = TRUE;
-                        // 必须从后往前删除，以防索引变化
                         for (int i = selCount - 1; i >= 0; i--) {
                             if (!DeleteNodeByTag(nodeTags[selItems[i]])) {
                                 allSucceeded = FALSE;
                             }
                         }
-
                         if (allSucceeded) {
                             MessageBoxW(hWnd, L"所选节点已成功删除。", L"成功", MB_OK);
                         } else {
                             MessageBoxW(hWnd, L"部分或全部节点删除失败，请检查config.json文件。", L"错误", MB_OK | MB_ICONERROR);
                         }
-
                         ParseTags();
                         RefreshNodeListBox(hListBox);
                     }
@@ -1773,7 +1445,6 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     return 0;
 }
 
-// 修改节点内容对话框的过程函数
 LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit, hOkBtn, hCancelBtn, hFormatBtn, hLabel;
     static MODIFY_NODE_PARAMS* pParams = NULL;
@@ -1786,8 +1457,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
 
             hLabel = CreateWindowW(L"STATIC", L"节点内容 (JSON格式):", WS_CHILD | WS_VISIBLE, 15, 10, 200, 20, hWnd, NULL, NULL, NULL);
             hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_VSCROLL | WS_HSCROLL, 15, 35, 450, 280, hWnd, (HMENU)ID_MODIFY_EDIT_CONTENT, NULL, NULL);
-            
-            // 调整按钮布局使其对称
             hFormatBtn = CreateWindowW(L"BUTTON", L"JSON格式化", WS_CHILD | WS_VISIBLE, 60, 340, 100, 30, hWnd, (HMENU)ID_MODIFY_FORMAT_BTN, NULL, NULL);
             hOkBtn = CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 220, 340, 80, 30, hWnd, (HMENU)ID_MODIFY_OK_BTN, NULL, NULL);
             hCancelBtn = CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE, 360, 340, 80, 30, hWnd, (HMENU)ID_MODIFY_CANCEL_BTN, NULL, NULL);
@@ -1804,7 +1473,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             if (contentMb) {
                 char* displayContentMb = ConvertLfToCrlf(contentMb);
                 free(contentMb);
-
                 if (displayContentMb) {
                     int wideLen = MultiByteToWideChar(CP_UTF8, 0, displayContentMb, -1, NULL, 0);
                     wchar_t* contentW = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
@@ -1820,7 +1488,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                 EnableWindow(hOkBtn, FALSE);
                 EnableWindow(hFormatBtn, FALSE);
             }
-
             RECT rc, rcOwner;
             GetWindowRect(hWnd, &rc);
             GetWindowRect(GetDesktopWindow(), &rcOwner);
@@ -1828,7 +1495,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                 rcOwner.left + (rcOwner.right - rcOwner.left - (rc.right - rc.left)) / 2,
                 rcOwner.top + (rcOwner.bottom - rcOwner.top - (rc.bottom - rc.top)) / 2,
                 0, 0, SWP_NOSIZE);
-
             break;
         }
         case WM_COMMAND: {
@@ -1836,32 +1502,26 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                 case ID_MODIFY_FORMAT_BTN: {
                     int textLen = GetWindowTextLengthW(hEdit);
                     if (textLen == 0) break;
-
                     wchar_t* contentW = (wchar_t*)malloc((textLen + 1) * sizeof(wchar_t));
                     if (!contentW) break;
                     GetWindowTextW(hEdit, contentW, textLen + 1);
-
                     int mbLen = WideCharToMultiByte(CP_UTF8, 0, contentW, -1, NULL, 0, NULL, NULL);
                     char* contentMb = (char*)malloc(mbLen);
                     if (!contentMb) { free(contentW); break; }
                     WideCharToMultiByte(CP_UTF8, 0, contentW, -1, contentMb, mbLen, NULL, NULL);
                     free(contentW);
-
                     cJSON* json = cJSON_Parse(contentMb);
                     if (!json) {
                         MessageBoxW(hWnd, L"当前内容不是有效的JSON格式，无法格式化。", L"格式化失败", MB_OK | MB_ICONERROR);
                         free(contentMb);
                         break;
                     }
-
                     char* formattedMb = cJSON_PrintBuffered(json, 1, 1);
                     cJSON_Delete(json);
                     free(contentMb);
-
                     if (formattedMb) {
                         char* displayFormattedMb = ConvertLfToCrlf(formattedMb);
                         free(formattedMb);
-
                         if (displayFormattedMb) {
                             int wideLen = MultiByteToWideChar(CP_UTF8, 0, displayFormattedMb, -1, NULL, 0);
                             wchar_t* formattedW = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
@@ -1884,20 +1544,17 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                     wchar_t* newContentW = (wchar_t*)malloc((textLen + 1) * sizeof(wchar_t));
                     if (!newContentW) break;
                     GetWindowTextW(hEdit, newContentW, textLen + 1);
-
                     int mbLen = WideCharToMultiByte(CP_UTF8, 0, newContentW, -1, NULL, 0, NULL, NULL);
                     char* newContentMb = (char*)malloc(mbLen);
                     if (!newContentMb) { free(newContentW); break; }
                     WideCharToMultiByte(CP_UTF8, 0, newContentW, -1, newContentMb, mbLen, NULL, NULL);
                     free(newContentW);
-
                     cJSON* newNodeJson = cJSON_Parse(newContentMb);
                     if (!newNodeJson) {
                         MessageBoxW(hWnd, L"内容不是有效的JSON格式。", L"错误", MB_OK | MB_ICONERROR);
                         free(newContentMb);
                         break;
                     }
-
                     cJSON* newTagJson = cJSON_GetObjectItem(newNodeJson, "tag");
                     if (!cJSON_IsString(newTagJson) || !newTagJson->valuestring || strlen(newTagJson->valuestring) == 0) {
                         MessageBoxW(hWnd, L"JSON内容中必须包含一个有效的 'tag' 字符串。", L"错误", MB_OK | MB_ICONERROR);
@@ -1905,7 +1562,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                         free(newContentMb);
                         break;
                     }
-
                     int newTagWLen = MultiByteToWideChar(CP_UTF8, 0, newTagJson->valuestring, -1, NULL, 0);
                     wchar_t* newTagW = (wchar_t*)malloc(newTagWLen * sizeof(wchar_t));
                     if (newTagW) {
@@ -1925,7 +1581,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                          free(newTagW);
                     }
                     cJSON_Delete(newNodeJson);
-
                     if (UpdateNodeByTag(pParams->oldTag, newContentMb)) {
                         pParams = (MODIFY_NODE_PARAMS*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
                         pParams->success = TRUE;
@@ -1961,7 +1616,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
     return 0;
 }
 
-// 添加新节点对话框的过程函数
 LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit, hOkBtn, hCancelBtn, hFormatBtn, hLabel;
 
@@ -1969,20 +1623,15 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_CREATE: {
             hLabel = CreateWindowW(L"STATIC", L"新节点内容 (JSON格式):", WS_CHILD | WS_VISIBLE, 15, 10, 200, 20, hWnd, NULL, NULL, NULL);
             hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_VSCROLL | WS_HSCROLL, 15, 35, 450, 280, hWnd, (HMENU)ID_ADD_EDIT_CONTENT, NULL, NULL);
-
-            // 调整按钮布局使其对称
             hFormatBtn = CreateWindowW(L"BUTTON", L"JSON格式化", WS_CHILD | WS_VISIBLE, 60, 340, 100, 30, hWnd, (HMENU)ID_ADD_FORMAT_BTN, NULL, NULL);
             hOkBtn = CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 220, 340, 80, 30, hWnd, (HMENU)ID_ADD_OK_BTN, NULL, NULL);
             hCancelBtn = CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE, 360, 340, 80, 30, hWnd, (HMENU)ID_ADD_CANCEL_BTN, NULL, NULL);
-
             SendMessage(hLabel, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hFormatBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hOkBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hCancelBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
             HFONT hJsonFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
             if(hJsonFont) SendMessage(hEdit, WM_SETFONT, (WPARAM)hJsonFont, TRUE);
-
             RECT rc, rcOwner;
             GetWindowRect(hWnd, &rc);
             GetWindowRect(GetDesktopWindow(), &rcOwner);
@@ -1990,7 +1639,6 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 rcOwner.left + (rcOwner.right - rcOwner.left - (rc.right - rc.left)) / 2,
                 rcOwner.top + (rcOwner.bottom - rcOwner.top - (rc.bottom - rc.top)) / 2,
                 0, 0, SWP_NOSIZE);
-
             break;
         }
         case WM_COMMAND: {
@@ -1998,32 +1646,26 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 case ID_ADD_FORMAT_BTN: {
                     int textLen = GetWindowTextLengthW(hEdit);
                     if (textLen == 0) break;
-
                     wchar_t* contentW = (wchar_t*)malloc((textLen + 1) * sizeof(wchar_t));
                     if (!contentW) break;
                     GetWindowTextW(hEdit, contentW, textLen + 1);
-
                     int mbLen = WideCharToMultiByte(CP_UTF8, 0, contentW, -1, NULL, 0, NULL, NULL);
                     char* contentMb = (char*)malloc(mbLen);
                     if (!contentMb) { free(contentW); break; }
                     WideCharToMultiByte(CP_UTF8, 0, contentW, -1, contentMb, mbLen, NULL, NULL);
                     free(contentW);
-
                     cJSON* json = cJSON_Parse(contentMb);
                     if (!json) {
                         MessageBoxW(hWnd, L"当前内容不是有效的JSON格式，无法格式化。", L"格式化失败", MB_OK | MB_ICONERROR);
                         free(contentMb);
                         break;
                     }
-
                     char* formattedMb = cJSON_PrintBuffered(json, 1, 1);
                     cJSON_Delete(json);
                     free(contentMb);
-
                     if (formattedMb) {
                         char* displayFormattedMb = ConvertLfToCrlf(formattedMb);
                         free(formattedMb);
-
                         if (displayFormattedMb) {
                             int wideLen = MultiByteToWideChar(CP_UTF8, 0, displayFormattedMb, -1, NULL, 0);
                             wchar_t* formattedW = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
@@ -2046,20 +1688,17 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     wchar_t* newContentW = (wchar_t*)malloc((textLen + 1) * sizeof(wchar_t));
                     if (!newContentW) break;
                     GetWindowTextW(hEdit, newContentW, textLen + 1);
-
                     int mbLen = WideCharToMultiByte(CP_UTF8, 0, newContentW, -1, NULL, 0, NULL, NULL);
                     char* newContentMb = (char*)malloc(mbLen);
                     if (!newContentMb) { free(newContentW); break; }
                     WideCharToMultiByte(CP_UTF8, 0, newContentW, -1, newContentMb, mbLen, NULL, NULL);
                     free(newContentW);
-
                     cJSON* newNodeJson = cJSON_Parse(newContentMb);
                     if (!newNodeJson) {
                         MessageBoxW(hWnd, L"内容不是有效的JSON格式。", L"错误", MB_OK | MB_ICONERROR);
                         free(newContentMb);
                         break;
                     }
-
                     cJSON* newTagJson = cJSON_GetObjectItem(newNodeJson, "tag");
                     if (!cJSON_IsString(newTagJson) || !newTagJson->valuestring || strlen(newTagJson->valuestring) == 0) {
                         MessageBoxW(hWnd, L"JSON内容中必须包含一个有效的 'tag' 字符串。", L"错误", MB_OK | MB_ICONERROR);
@@ -2067,7 +1706,6 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                         free(newContentMb);
                         break;
                     }
-
                     int newTagWLen = MultiByteToWideChar(CP_UTF8, 0, newTagJson->valuestring, -1, NULL, 0);
                     wchar_t* newTagW = (wchar_t*)malloc(newTagWLen * sizeof(wchar_t));
                     if (newTagW) {
@@ -2078,14 +1716,12 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                          }
                          free(newTagW);
                          if (duplicate) {
-                             // 启动时已自动修复，但此处保留检查以防万一
                              MessageBoxW(hWnd, L"节点名称已存在，请使用其他名称。\n(程序启动时会自动修复重复标签)", L"错误", MB_OK | MB_ICONERROR);
                              cJSON_Delete(newNodeJson); free(newContentMb);
                              return 0;
                          }
                     }
                     cJSON_Delete(newNodeJson);
-
                     if (AddNodeToConfig(newContentMb)) {
                         MessageBoxW(GetParent(hWnd), L"节点添加成功！", L"成功", MB_OK);
                         DestroyWindow(hWnd);
@@ -2115,25 +1751,17 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     return 0;
 }
 
-
-// =========================================================================
-// (已修改) 从配置文件中删除指定tag的节点
-// (新增) 同步更新 "自动切换" selector 列表
-// =========================================================================
 BOOL DeleteNodeByTag(const wchar_t* tagToDelete) {
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return FALSE;
-
     cJSON* root = cJSON_Parse(buffer);
     free(buffer);
     if (!root) return FALSE;
-
     int mbLen = WideCharToMultiByte(CP_UTF8, 0, tagToDelete, -1, NULL, 0, NULL, NULL);
     char* tagToDeleteMb = (char*)malloc(mbLen);
     if (!tagToDeleteMb) { cJSON_Delete(root); return FALSE; }
     WideCharToMultiByte(CP_UTF8, 0, tagToDelete, -1, tagToDeleteMb, mbLen, NULL, NULL);
-
     BOOL success = FALSE;
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!cJSON_IsArray(outbounds)) {
@@ -2141,45 +1769,33 @@ BOOL DeleteNodeByTag(const wchar_t* tagToDelete) {
         free(tagToDeleteMb);
         return FALSE;
     }
-    
-    // (--- 新增逻辑：从 "自动切换" selector 中移除 tag ---)
-    // 1. 检查是否为特殊节点 (这些节点不应在 selector 中)
     if (strcmp(tagToDeleteMb, "直接连接") != 0 &&
         strcmp(tagToDeleteMb, "阻塞") != 0 &&
         strcmp(tagToDeleteMb, "自动切换") != 0)
     {
-        // 2. 遍历 outbounds 找到 "自动切换" 节点
         cJSON* outbound_iter = NULL;
         cJSON_ArrayForEach(outbound_iter, outbounds) {
             cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
             cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
-            
-            // (--- 已修改：匹配用户配置中的 "🎈 自动选择" ---)
             if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "🎈 自动选择") == 0 &&
                 cJSON_IsString(type_item) && (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
             {
-                // 3. 找到了 selector/urltest, 遍历其内部的 outbounds 数组
                 cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
                 if (cJSON_IsArray(selector_outbounds)) {
                     int i = 0;
                     cJSON* selector_tag_item = NULL;
                     cJSON_ArrayForEach(selector_tag_item, selector_outbounds) {
-                        // 4. 找到匹配的 tag 字符串并删除
                         if (cJSON_IsString(selector_tag_item) && strcmp(selector_tag_item->valuestring, tagToDeleteMb) == 0) {
                             cJSON_DeleteItemFromArray(selector_outbounds, i);
-                            break; // 假设 tag 在 selector 中只出现一次
+                            break;
                         }
                         i++;
                     }
                 }
-                break; // 假设只有一个 "🎈 自动选择"
+                break;
             }
         }
     }
-    // (--- 新增逻辑结束 ---)
-
-
-    // (--- 原有逻辑：从主 outbounds 数组中移除节点对象 ---)
     int i = 0;
     cJSON* outbound = NULL;
     cJSON_ArrayForEach(outbound, outbounds) {
@@ -2191,10 +1807,8 @@ BOOL DeleteNodeByTag(const wchar_t* tagToDelete) {
         }
         i++;
     }
-
     if (success) {
         char* newContent = cJSON_PrintBuffered(root, 1, 1);
-
         if (newContent) {
             FILE* out = NULL;
             if (_wfopen_s(&out, L"config.json", L"wb") == 0 && out != NULL) {
@@ -2206,28 +1820,22 @@ BOOL DeleteNodeByTag(const wchar_t* tagToDelete) {
             success = FALSE;
         }
     }
-
     cJSON_Delete(root);
     free(tagToDeleteMb);
     return success;
 }
 
-
-// 通过Tag获取节点的完整JSON内容（返回的字符串需要手动free）
 char* GetNodeContentByTag(const wchar_t* tagToFind) {
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return NULL;
-
     cJSON* root = cJSON_Parse(buffer);
     free(buffer);
     if (!root) return NULL;
-
     int mbLen = WideCharToMultiByte(CP_UTF8, 0, tagToFind, -1, NULL, 0, NULL, NULL);
     char* tagToFindMb = (char*)malloc(mbLen);
     if (!tagToFindMb) { cJSON_Delete(root); return NULL; }
     WideCharToMultiByte(CP_UTF8, 0, tagToFind, -1, tagToFindMb, mbLen, NULL, NULL);
-
     char* content = NULL;
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (cJSON_IsArray(outbounds)) {
@@ -2240,34 +1848,24 @@ char* GetNodeContentByTag(const wchar_t* tagToFind) {
             }
         }
     }
-
     cJSON_Delete(root);
     free(tagToFindMb);
     return content;
 }
 
-
-// =========================================================================
-// (已修改) 通过Tag更新节点的完整JSON内容
-// (新增) 同步更新 "自动切换" selector 列表中的 tag 名称
-// =========================================================================
 BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return FALSE;
-
     cJSON* root = cJSON_Parse(buffer);
     free(buffer);
     if (!root) return FALSE;
-
     cJSON* newNode = cJSON_Parse(newNodeContentJson);
     if (!newNode) { cJSON_Delete(root); return FALSE; }
-
     int oldTagMbLen = WideCharToMultiByte(CP_UTF8, 0, oldTag, -1, NULL, 0, NULL, NULL);
     char* oldTagMb = (char*)malloc(oldTagMbLen);
     if (!oldTagMb) { cJSON_Delete(root); cJSON_Delete(newNode); return FALSE; }
     WideCharToMultiByte(CP_UTF8, 0, oldTag, -1, oldTagMb, oldTagMbLen, NULL, NULL);
-
     BOOL success = FALSE;
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (cJSON_IsArray(outbounds)) {
@@ -2284,17 +1882,13 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
             i++;
         }
     }
-
     if (!success) {
-        cJSON_Delete(newNode); // 替换失败，必须删除新节点
+        cJSON_Delete(newNode);
     }
-
     if (success && wcscmp(oldTag, currentNode) == 0) {
         cJSON* newTagJson = cJSON_GetObjectItem(newNode, "tag");
         const char* newTagMb = newTagJson->valuestring;
-
         if (strcmp(oldTagMb, newTagMb) != 0) {
-            // (--- 原有逻辑：更新 route.final ---)
             cJSON* route = cJSON_GetObjectItem(root, "route");
             if (route) {
                 cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
@@ -2305,35 +1899,25 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
             MultiByteToWideChar(CP_UTF8, 0, newTagMb, -1, currentNode, ARRAYSIZE(currentNode));
         }
     }
-    
-    // (--- 新增逻辑：如果 tag 名称改变，同步更新 "自动切换" selector ---)
     if (success) {
         cJSON* newTagJson = cJSON_GetObjectItem(newNode, "tag");
         const char* newTagMb = newTagJson->valuestring;
-
-        // 仅在 tag 确实发生变化时执行
         if (strcmp(oldTagMb, newTagMb) != 0) {
-            // 1. 检查是否为特殊节点
             if (strcmp(oldTagMb, "🎯 全球直连") != 0 &&
                 strcmp(oldTagMb, "🚫 断开连接") != 0 &&
                 strcmp(oldTagMb, "🎈 自动选择") != 0)
             {
-                // 2. 遍历 outbounds 找到 "自动切换" 节点
                 cJSON* outbound_iter = NULL;
                 cJSON_ArrayForEach(outbound_iter, outbounds) {
                     cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
                     cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
-                    
-                    // (--- 已修改：匹配用户配置中的 "🎈 自动选择" ---)
                     if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "🎈 自动选择") == 0 &&
                         cJSON_IsString(type_item) && (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
                     {
-                        // 3. 找到了 selector/urltest, 遍历其内部的 outbounds 数组
                         cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
                         if (cJSON_IsArray(selector_outbounds)) {
                             cJSON* selector_tag_item = NULL;
                             cJSON_ArrayForEach(selector_tag_item, selector_outbounds) {
-                                // 4. 找到匹配的旧 tag 字符串并替换为新 tag
                                 if (cJSON_IsString(selector_tag_item) && strcmp(selector_tag_item->valuestring, oldTagMb) == 0) {
                                     cJSON_SetValuestring(selector_tag_item, newTagMb);
                                     break; 
@@ -2346,12 +1930,8 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
             }
         }
     }
-    // (--- 新增逻辑结束 ---)
-
-
     if (success) {
         char* newContent = cJSON_PrintBuffered(root, 1, 1);
-
         if (newContent) {
             FILE* out = NULL;
             if (_wfopen_s(&out, L"config.json", L"wb") == 0 && out != NULL) {
@@ -2363,86 +1943,59 @@ BOOL UpdateNodeByTag(const wchar_t* oldTag, const char* newNodeContentJson) {
             success = FALSE;
         }
     }
-
     cJSON_Delete(root);
     free(oldTagMb);
     return success;
 }
 
-// =========================================================================
-// (已修改) 向配置文件中添加新节点
-// (新增) 同步更新 "自动切换" selector 列表
-// =========================================================================
 BOOL AddNodeToConfig(const char* newNodeContentJson) {
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return FALSE;
-
     cJSON* root = cJSON_Parse(buffer);
     free(buffer);
     if (!root) return FALSE;
-
     cJSON* newNode = cJSON_Parse(newNodeContentJson);
     if (!newNode) {
         cJSON_Delete(root);
         return FALSE;
     }
-
-    // (--- 新增逻辑：获取新节点的 tag ---)
     cJSON* newTagJson = cJSON_GetObjectItem(newNode, "tag");
     if (!cJSON_IsString(newTagJson) || !newTagJson->valuestring || strlen(newTagJson->valuestring) == 0) {
-        // 节点必须有 tag (在 AddNodeWndProc 中已检查, 此处为安全冗余)
         cJSON_Delete(newNode);
         cJSON_Delete(root);
         return FALSE;
     }
     const char* newTagMb = newTagJson->valuestring;
-    // (--- 新增逻辑结束 ---)
-
-
     BOOL success = FALSE;
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (cJSON_IsArray(outbounds)) {
-        // (--- 原有逻辑 ---)
         cJSON_AddItemToArray(outbounds, newNode);
         success = TRUE;
-
-        // (--- 新增逻辑：将新 tag 添加到 "自动切换" selector ---)
-        // 1. 检查是否为特殊节点
         if (strcmp(newTagMb, "🎯 全球直连") != 0 &&
             strcmp(newTagMb, "🚫 断开连接") != 0 &&
             strcmp(newTagMb, "🎈 自动选择") != 0)
         {
-            // 2. 遍历 outbounds 找到 "自动切换" 节点
             cJSON* outbound_iter = NULL;
             cJSON_ArrayForEach(outbound_iter, outbounds) {
                 cJSON* tag_item = cJSON_GetObjectItem(outbound_iter, "tag");
                 cJSON* type_item = cJSON_GetObjectItem(outbound_iter, "type");
-                
-                // (--- 已修改：匹配用户配置中的 "🎈 自动选择" ---)
                 if (cJSON_IsString(tag_item) && strcmp(tag_item->valuestring, "🎈 自动选择") == 0 &&
                     cJSON_IsString(type_item) && (strcmp(type_item->valuestring, "selector") == 0 || strcmp(type_item->valuestring, "urltest") == 0))
                 {
-                    // 3. 找到了 selector/urltest, 获取其内部的 outbounds 数组
                     cJSON* selector_outbounds = cJSON_GetObjectItem(outbound_iter, "outbounds");
                     if (cJSON_IsArray(selector_outbounds)) {
-                        // 4. 将新节点的 tag 字符串添加进去
                         cJSON_AddItemToArray(selector_outbounds, cJSON_CreateString(newTagMb));
                     }
                     break; 
                 }
             }
         }
-        // (--- 新增逻辑结束 ---)
-
     } else {
-        // 如果连主 outbounds 都没有，直接释放新节点
         cJSON_Delete(newNode);
     }
-
     if (success) {
         char* newContent = cJSON_PrintBuffered(root, 1, 1);
-
         if (newContent) {
             FILE* out = NULL;
             if (_wfopen_s(&out, L"config.json", L"wb") == 0 && out != NULL) {
@@ -2456,26 +2009,21 @@ BOOL AddNodeToConfig(const char* newNodeContentJson) {
             success = FALSE;
         }
     }
-
     cJSON_Delete(root);
     return success;
 }
 
-// 将指定tag的节点移动到outbounds数组的第一个位置
 BOOL PinNodeByTag(const wchar_t* tagToPin) {
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return FALSE;
-
     cJSON* root = cJSON_Parse(buffer);
     free(buffer);
     if (!root) return FALSE;
-
     int mbLen = WideCharToMultiByte(CP_UTF8, 0, tagToPin, -1, NULL, 0, NULL, NULL);
     char* tagToPinMb = (char*)malloc(mbLen);
     if (!tagToPinMb) { cJSON_Delete(root); return FALSE; }
     WideCharToMultiByte(CP_UTF8, 0, tagToPin, -1, tagToPinMb, mbLen, NULL, NULL);
-
     BOOL success = FALSE;
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (cJSON_IsArray(outbounds)) {
@@ -2491,13 +2039,12 @@ BOOL PinNodeByTag(const wchar_t* tagToPin) {
             i++;
         }
         if (nodeToPin) {
-            cJSON_AddItemToArray(outbounds, nodeToPin); // First add to end to handle memory
-            cJSON* last = cJSON_DetachItemFromArray(outbounds, cJSON_GetArraySize(outbounds)-1); // Detach it again from the end
-            cJSON_InsertItemInArray(outbounds, 0, last); // Insert at the beginning
+            cJSON_AddItemToArray(outbounds, nodeToPin);
+            cJSON* last = cJSON_DetachItemFromArray(outbounds, cJSON_GetArraySize(outbounds)-1);
+            cJSON_InsertItemInArray(outbounds, 0, last);
             success = TRUE;
         }
     }
-
     if (success) {
         char* newContent = cJSON_PrintBuffered(root, 1, 1);
         if (newContent) {
@@ -2513,35 +2060,28 @@ BOOL PinNodeByTag(const wchar_t* tagToPin) {
             success = FALSE;
         }
     }
-
     cJSON_Delete(root);
     free(tagToPinMb);
     return success;
 }
 
-// 移除配置文件中的重复节点, 返回移除的数量, -1表示失败
 int DeduplicateNodes() {
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return -1;
-
     cJSON* root = cJSON_Parse(buffer);
     free(buffer);
     if (!root) return -1;
-
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!cJSON_IsArray(outbounds)) {
         cJSON_Delete(root);
         return -1;
     }
-
     int original_count = cJSON_GetArraySize(outbounds);
     if (original_count <= 1) {
         cJSON_Delete(root);
         return 0;
     }
-
-    // 将当前节点 wchar_t* 转换为 char*
     int mbLen = WideCharToMultiByte(CP_UTF8, 0, currentNode, -1, NULL, 0, NULL, NULL);
     char* currentNodeMb = (char*)malloc(mbLen);
     if (!currentNodeMb) {
@@ -2549,19 +2089,16 @@ int DeduplicateNodes() {
         return -1;
     }
     WideCharToMultiByte(CP_UTF8, 0, currentNode, -1, currentNodeMb, mbLen, NULL, NULL);
-
     cJSON* new_outbounds = cJSON_CreateArray();
     char** seen_fingerprints = (char**)calloc(original_count, sizeof(char*));
     int seen_count = 0;
     int removed_count = 0;
-
     cJSON* node = NULL;
     cJSON_ArrayForEach(node, outbounds) {
         cJSON* temp_node = cJSON_Duplicate(node, 1);
         cJSON_DeleteItemFromObject(temp_node, "tag");
         char* fingerprint = cJSON_PrintUnformatted(temp_node);
         cJSON_Delete(temp_node);
-
         BOOL is_duplicate = FALSE;
         for (int i = 0; i < seen_count; i++) {
             if (strcmp(seen_fingerprints[i], fingerprint) == 0) {
@@ -2569,7 +2106,6 @@ int DeduplicateNodes() {
                 break;
             }
         }
-
         BOOL is_current_node = FALSE;
         cJSON* tag_item = cJSON_GetObjectItem(node, "tag");
         if (cJSON_IsString(tag_item) && tag_item->valuestring) {
@@ -2577,36 +2113,24 @@ int DeduplicateNodes() {
                 is_current_node = TRUE;
             }
         }
-        
-        // 如果是重复节点，并且不是当前正在使用的节点，则跳过（即删除）
         if (is_duplicate && !is_current_node) {
             removed_count++;
             free(fingerprint);
             continue;
         }
-
-        // 否则，保留该节点
         cJSON_AddItemToArray(new_outbounds, cJSON_Duplicate(node, 1));
-
-        // 如果该指纹是第一次见到，则记录下来
         if (!is_duplicate) {
             seen_fingerprints[seen_count++] = fingerprint;
         } else {
-            free(fingerprint); // 如果是重复的指纹，则释放内存
+            free(fingerprint);
         }
     }
-
-    // 释放所有指纹字符串
     for (int i = 0; i < seen_count; i++) {
         free(seen_fingerprints[i]);
     }
     free(seen_fingerprints);
     free(currentNodeMb);
-
-    // 用新的去重后的数组替换旧数组
     cJSON_ReplaceItemInObject(root, "outbounds", new_outbounds);
-
-    // 写回文件
     BOOL success = FALSE;
     char* newContent = cJSON_PrintBuffered(root, 1, 1);
     if (newContent) {
@@ -2618,72 +2142,50 @@ int DeduplicateNodes() {
         }
         free(newContent);
     }
-    
     cJSON_Delete(root);
-
     return success ? removed_count : -1;
 }
 
-// 用于qsort的比较函数，根据节点 "tag" 字段进行排序
 static int compare_nodes_by_name(const void* a, const void* b) {
     const cJSON* nodeA = *(const cJSON**)a;
     const cJSON* nodeB = *(const cJSON**)b;
-
     cJSON* tagA_item = cJSON_GetObjectItem(nodeA, "tag");
     cJSON* tagB_item = cJSON_GetObjectItem(nodeB, "tag");
-
-    // 安全地获取tag字符串，如果tag不存在或不是字符串，则视为空字符串
     const char* tagA = (cJSON_IsString(tagA_item) && tagA_item->valuestring) ? tagA_item->valuestring : "";
     const char* tagB = (cJSON_IsString(tagB_item) && tagB_item->valuestring) ? tagB_item->valuestring : "";
-
     return strcmp(tagA, tagB);
 }
 
-// 按名称对配置文件中的节点进行排序
 BOOL SortNodesByName() {
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return FALSE;
-
     cJSON* root = cJSON_Parse(buffer);
     free(buffer);
     if (!root) return FALSE;
-
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!cJSON_IsArray(outbounds)) {
         cJSON_Delete(root);
         return FALSE;
     }
-
     int count = cJSON_GetArraySize(outbounds);
     if (count <= 1) {
         cJSON_Delete(root);
-        return TRUE; // 只有一个或没有节点，无需排序
+        return TRUE;
     }
-
-    // 创建一个 cJSON 指针数组来保存分离出的节点
     cJSON** nodes = (cJSON**)malloc(count * sizeof(cJSON*));
     if (!nodes) {
         cJSON_Delete(root);
         return FALSE;
     }
-
-    // 从 outbounds 数组中分离出所有节点
     for (int i = 0; i < count; i++) {
-        nodes[i] = cJSON_DetachItemFromArray(outbounds, 0); // 每次都分离第一个
+        nodes[i] = cJSON_DetachItemFromArray(outbounds, 0);
     }
-
-    // 使用 qsort 对节点指针数组进行排序
     qsort(nodes, count, sizeof(cJSON*), compare_nodes_by_name);
-
-    // 将排序后的节点重新添加回空的 outbounds 数组中
     for (int i = 0; i < count; i++) {
         cJSON_AddItemToArray(outbounds, nodes[i]);
     }
-
-    // 释放指针数组本身（节点已被重新附加，不应释放）
     free(nodes);
-
     BOOL success = FALSE;
     char* newContent = cJSON_PrintBuffered(root, 1, 1);
     if (newContent) {
@@ -2695,43 +2197,27 @@ BOOL SortNodesByName() {
         }
         free(newContent);
     }
-
     cJSON_Delete(root);
     return success;
 }
 
-/**
- * @brief 自动修复配置文件中重复的 "tag" 名称。
- * * 遍历所有 outbounds，如果发现 "tag" 名称已存在，
- * 则自动附加 "(1)", "(2)" 等后缀，直到名称唯一。
- * * 同时，如果当前活动节点被重命名，会自动更新 'route' 部分。
- * * @return int 成功重命名的节点数量。
- * 0   表示没有发现重复项。
- * -1  表示发生错误 (如文件读写失败, JSON格式错误)。
- */
 int FixDuplicateTags() {
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) return -1;
-
     cJSON* root = cJSON_Parse(buffer);
     free(buffer);
     if (!root) return -1;
-
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!cJSON_IsArray(outbounds)) {
         cJSON_Delete(root);
         return -1;
     }
-
     int count = cJSON_GetArraySize(outbounds);
     if (count <= 1) {
         cJSON_Delete(root);
-        return 0; // 只有一个或没有节点，不可能重复
+        return 0;
     }
-
-    // 创建一个 "已使用标签" 列表
-    // 使用 calloc 确保所有指针初始化为 NULL
     char** seenTags = (char**)calloc(count, sizeof(char*));
     if (!seenTags) {
         cJSON_Delete(root);
@@ -2741,44 +2227,31 @@ int FixDuplicateTags() {
     int renamedCount = 0;
     BOOL hasChanges = FALSE;
     char* currentActiveTagMb = NULL;
-    
-    // 转换当前活动节点标签 (wchar_t -> char*)
     int mbLen = WideCharToMultiByte(CP_UTF8, 0, currentNode, -1, NULL, 0, NULL, NULL);
     currentActiveTagMb = (char*)malloc(mbLen);
     if (currentActiveTagMb) {
          WideCharToMultiByte(CP_UTF8, 0, currentNode, -1, currentActiveTagMb, mbLen, NULL, NULL);
     }
-
-
     cJSON* node = NULL;
     cJSON_ArrayForEach(node, outbounds) {
         cJSON* tagItem = cJSON_GetObjectItem(node, "tag");
         if (!cJSON_IsString(tagItem) || !tagItem->valuestring || strlen(tagItem->valuestring) == 0) {
-            continue; // 跳过没有标签或标签为空的节点
+            continue;
         }
-
         char* currentTag = tagItem->valuestring;
         BOOL isDuplicate = FALSE;
-
-        // 检查 "seenTags" 列表中是否已存在该标签
         for (int i = 0; i < seenCount; i++) {
             if (strcmp(seenTags[i], currentTag) == 0) {
                 isDuplicate = TRUE;
                 break;
             }
         }
-
         if (isDuplicate) {
-            // 发现重复标签，必须重命名
             int suffix = 1;
-            char newTagBuffer[512]; // 假设标签名不会超长
+            char newTagBuffer[512];
             BOOL uniqueTagFound = FALSE;
-
             while (!uniqueTagFound) {
-                // 构造新标签名，例如 "SEA-vless (1)"
                 snprintf(newTagBuffer, sizeof(newTagBuffer), "%s (%d)", currentTag, suffix);
-
-                // 检查这个 *新构造* 的标签是否也已存在
                 BOOL newTagConflict = FALSE;
                 for (int i = 0; i < seenCount; i++) {
                     if (strcmp(seenTags[i], newTagBuffer) == 0) {
@@ -2786,62 +2259,42 @@ int FixDuplicateTags() {
                         break;
                     }
                 }
-
                 if (!newTagConflict) {
-                    // 找到了一个独一无二的新名称
                     uniqueTagFound = TRUE;
-                    
                     BOOL isCurrentActiveNode = (currentActiveTagMb && strcmp(currentTag, currentActiveTagMb) == 0);
-
-                    // 1. 修改 cJSON 'outbounds' 对象中的 "tag" 值
                     cJSON_SetValuestring(tagItem, newTagBuffer);
-                    
-                    // 2. 如果被重命名的是当前活动节点，
-                    //    我们必须 *在同一个 cJSON root* 中更新 'route' 部分
                     if (isCurrentActiveNode) {
                         cJSON* route = cJSON_GetObjectItem(root, "route");
                         if (route) {
-                            // (--- 已修改 ---)
-                            // 确保更新 route.final
                             cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
-                            // 检查 'final' 是否指向 *旧的* 标签名
                             if (final_outbound && strcmp(final_outbound->valuestring, currentActiveTagMb) == 0) {
-                                cJSON_SetValuestring(final_outbound, newTagBuffer); // 设置为 *新的* 标签名
+                                cJSON_SetValuestring(final_outbound, newTagBuffer);
                             }
                         }
                     }
-
-                    // 3. 将这个新名称添加到 "seenTags" 列表中
                     seenTags[seenCount] = strdup(newTagBuffer);
                     if (seenTags[seenCount]) {
                         seenCount++;
                     }
-                    
                     renamedCount++;
                     hasChanges = TRUE;
                 } else {
-                    // 新名称依然冲突 (例如 "Tag (1)" 已存在)，增加后缀重试
                     suffix++;
                 }
             }
         } else {
-            // 标签不重复，将其添加到 "seenTags" 列表
             seenTags[seenCount] = strdup(currentTag);
             if (seenTags[seenCount]) {
                 seenCount++;
             }
         }
     }
-
-    // 释放 "seenTags" 列表及其中的字符串
     for (int i = 0; i < seenCount; i++) {
         free(seenTags[i]);
     }
     free(seenTags);
     if(currentActiveTagMb) free(currentActiveTagMb);
-
     if (hasChanges) {
-        // 如果有修改，则写回 config.json 文件
         char* newContent = cJSON_PrintBuffered(root, 1, 1);
         if (newContent) {
             FILE* out = NULL;
@@ -2849,111 +2302,76 @@ int FixDuplicateTags() {
                 fwrite(newContent, 1, strlen(newContent), out);
                 fclose(out);
             } else {
-                renamedCount = -1; // 标记文件写入失败
+                renamedCount = -1;
             }
             free(newContent);
         } else {
-            renamedCount = -1; // 标记 cJSON 打印失败
+            renamedCount = -1;
         }
     }
-
     cJSON_Delete(root);
     return renamedCount;
 }
 
-
-// =========================================================================
-// (--- 新增 ---) 日志查看器功能实现
-// =========================================================================
-
-// 日志窗口过程函数
 LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit = NULL;
-    // 定义日志缓冲区的大小限制，防止窗口因日志过多而卡死
-    const int MAX_LOG_LENGTH = 200000;  // 最大字符数
-    const int TRIM_LOG_LENGTH = 100000; // 裁剪后保留的字符数
-
+    const int MAX_LOG_LENGTH = 200000;
+    const int TRIM_LOG_LENGTH = 100000;
     switch (msg) {
         case WM_CREATE: {
             hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL |
                                     ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-                                    0, 0, 0, 0, // 将在 WM_SIZE 中调整大小
+                                    0, 0, 0, 0,
                                     hWnd, (HMENU)ID_LOGVIEWER_EDIT,
                                     GetModuleHandle(NULL), NULL);
-            
             if (hEdit == NULL) {
                 ShowError(L"创建失败", L"无法创建日志显示框。");
-                return -1; // 阻止窗口创建
+                return -1;
             }
-            
-            // 设置等宽字体
             SendMessage(hEdit, WM_SETFONT, (WPARAM)hLogFont, TRUE);
             break;
         }
-
         case WM_LOG_UPDATE: {
-            // 这是从 LogMonitorThread 线程接收到的消息
             wchar_t* pLogChunk = (wchar_t*)lParam;
             if (pLogChunk) {
-                // 性能优化：检查是否需要裁剪日志
                 int textLen = GetWindowTextLengthW(hEdit);
                 if (textLen > MAX_LOG_LENGTH) {
-                    // 裁剪：删除前 TRIM_LOG_LENGTH 个字符
                     SendMessageW(hEdit, EM_SETSEL, 0, TRIM_LOG_LENGTH);
                     SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)L"[... 日志已裁剪 ...]\r\n");
                 }
-
-                // 追加新文本
-                SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1); // 移动到文本末尾
-                SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)pLogChunk); // 追加新日志
-                
-                // 释放由 LogMonitorThread 分配的内存
+                SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+                SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)pLogChunk);
                 free(pLogChunk);
             }
             break;
         }
-
         case WM_SIZE: {
-            // 窗口大小改变时，自动填满 EDIT 控件
             RECT rcClient;
             GetClientRect(hWnd, &rcClient);
             MoveWindow(hEdit, 0, 0, rcClient.right, rcClient.bottom, TRUE);
             break;
         }
-
         case WM_CLOSE: {
-            // (--- 修改 ---)
-            // 用户点击关闭时，只隐藏窗口，不销毁
-            // 不要设置 hLogViewerWnd = NULL，这样后台可以继续接收日志
             ShowWindow(hWnd, SW_HIDE);
-            // hLogViewerWnd = NULL; // <-- 移除这一行
             break;
         }
-
         case WM_DESTROY: {
-            // (--- 修改 ---)
-            // 窗口被真正销毁时（例如程序退出时）
-            hLogViewerWnd = NULL; // <-- hLogViewerWnd = NULL; 应该在这里
+            hLogViewerWnd = NULL;
             break;
         }
-
         default:
             return DefWindowProcW(hWnd, msg, wParam, lParam);
     }
     return 0;
 }
 
-// 打开或显示日志窗口
 void OpenLogViewerWindow() {
     if (hLogViewerWnd != NULL) {
-        // 窗口已存在，只需显示并置顶
         ShowWindow(hLogViewerWnd, SW_SHOW);
         SetForegroundWindow(hLogViewerWnd);
         return;
     }
-
-    // 窗口不存在，需要创建
     const wchar_t* LOGVIEWER_CLASS_NAME = L"SingboxLogViewerClass";
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = LogViewerWndProc;
@@ -2961,28 +2379,24 @@ void OpenLogViewerWindow() {
     wc.lpszClassName = LOGVIEWER_CLASS_NAME;
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hIcon = LoadIconW(GetModuleHandle(NULL), MAKEINTRESOURCE(1)); // 使用主程序图标
+    wc.hIcon = LoadIconW(GetModuleHandle(NULL), MAKEINTRESOURCE(1));
     if (wc.hIcon == NULL) {
-        wc.hIcon = LoadIconW(NULL, IDI_APPLICATION); // 备用图标
+        wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     }
-
     if (!GetClassInfoW(wc.hInstance, LOGVIEWER_CLASS_NAME, &wc)) {
         if (!RegisterClassW(&wc)) {
             ShowError(L"窗口注册失败", L"无法注册日志窗口类。");
             return;
         }
     }
-
     hLogViewerWnd = CreateWindowExW(
         0, LOGVIEWER_CLASS_NAME, L"Sing-box 实时日志",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 450,
-        hwnd, // 父窗口设为主窗口，以便管理
+        hwnd,
         NULL, wc.hInstance, NULL
     );
-
     if (hLogViewerWnd) {
-        // 尝试将窗口居中
         RECT rc, rcOwner;
         GetWindowRect(hLogViewerWnd, &rc);
         GetWindowRect(GetDesktopWindow(), &rcOwner);
@@ -2995,21 +2409,12 @@ void OpenLogViewerWindow() {
     }
 }
 
-
-// =========================================================================
-// (--- 新增：异步初始化工作线程 ---)
-// (--- 已修改：DownloadConfig 调用 ---)
-// =========================================================================
 DWORD WINAPI InitThread(LPVOID lpParam) {
     HWND hWndMain = (HWND)lpParam;
-    
-    // (--- 启动逻辑从 wWinMain 迁移至此 ---)
-
     const wchar_t* configPath = L"config.json";
     wchar_t tempConfigPath[MAX_PATH] = {0};
     BOOL isRemoteMode = (wcslen(g_configUrl) > 0);
 
-    // (--- 宏替换：在线程上下文中，失败时发送消息并退出线程 ---)
     #define THREAD_CLEANUP_AND_EXIT(success) \
         do { \
             if (tempConfigPath[0] != L'\0') DeleteFileW(tempConfigPath); \
@@ -3018,8 +2423,6 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         } while (0)
 
     if (isRemoteMode) {
-        // --- 模式2：远程配置 ---
-        
         wchar_t tempDir[MAX_PATH];
         DWORD tempPathLen = GetTempPathW(MAX_PATH, tempDir);
         if (tempPathLen == 0 || tempPathLen > MAX_PATH) {
@@ -3031,50 +2434,34 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
             tempConfigPath[0] = L'\0';
             THREAD_CLEANUP_AND_EXIT(FALSE);
         }
-        
-        // (--- 注意：ShowTrayTip 只能在主线程调用，此处不再显示 "正在检查" ---)
-        
-        // (--- 已修改：传入 hWndMain 参数 ---)
         if (!DownloadConfig(hWndMain, g_configUrl, tempConfigPath)) {
-            // 下载失败 -> 检查缓存
             DWORD fileAttrCache = GetFileAttributesW(configPath);
             if (fileAttrCache == INVALID_FILE_ATTRIBUTES || (fileAttrCache & FILE_ATTRIBUTE_DIRECTORY)) {
-                 // 无缓存 -> 创建默认配置
                  CreateDefaultConfig();
             }
-            // (--- 清理临时文件 ---)
             if (tempConfigPath[0] != L'\0') {
                 DeleteFileW(tempConfigPath);
                 tempConfigPath[0] = L'\0';
             }
         } else {
-             // 下载成功 -> 处理下载的文件
              DWORD fileAttr = GetFileAttributesW(configPath);
              BOOL configExists = (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY));
-
              if (configExists) {
-                 // 本地存在，比较大小
                  long oldSize = 0, newSize = 0;
                  char* oldBuf = NULL, *newBuf = NULL;
                  ReadFileToBuffer(configPath, &oldBuf, &oldSize); 
                  if (oldBuf) free(oldBuf);
                  ReadFileToBuffer(tempConfigPath, &newBuf, &newSize);
                  if (newBuf) free(newBuf);
-
                  if (newSize > 0 && abs(newSize - oldSize) > 100) {
-                     // 覆盖
-                     // (--- 已修改：使用跨卷移动 ---)
                      if (!MoveFileCrossVolumeW(tempConfigPath, configPath)) {
                          ShowError(L"配置更新失败", L"无法覆盖旧的 config.json。");
                          DeleteFileW(tempConfigPath);
                      }
                  } else {
-                     // 保留
                      DeleteFileW(tempConfigPath);
                  }
              } else {
-                 // 本地不存在 -> 应用新配置
-                 // (--- 已修改：使用跨卷移动 ---)
                  if (!MoveFileCrossVolumeW(tempConfigPath, configPath)) {
                       ShowError(L"启动失败", L"无法将下载的配置 (tmp) 重命名为 config.json。");
                       DeleteFileW(tempConfigPath);
@@ -3084,65 +2471,40 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
              tempConfigPath[0] = L'\0';
         }
     } else {
-        // --- 模式1：本地配置 ---
         DWORD fileAttr = GetFileAttributesW(configPath);
         if (fileAttr == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND) {
             CreateDefaultConfig();
         }
     }
-
-    // --- (公共逻辑：解析和修复) ---
-
     if (!ParseTags()) {
         MessageBoxW(NULL, L"无法读取或解析 config.json 文件。\n请检查文件是否存在且格式正确。", L"JSON 解析失败", MB_OK | MB_ICONERROR);
         THREAD_CLEANUP_AND_EXIT(FALSE);
     }
-
-    // (currentNode 必须在 FixDuplicateTags 之前被 ParseTags 设置)
     int renamedCount = FixDuplicateTags();
-    
     if (renamedCount == -1) {
         MessageBoxW(NULL, L"尝试自动修复重复标签时发生错误。\n请检查 config.json 文件权限。", L"修复错误", MB_OK | MB_ICONWARNING);
-        // 注意：这里是非致命错误，继续执行
     } else if (renamedCount > 0) {
-        // (--- 关键 ---)
-        // 标签被重命名，必须重新解析，以确保 currentNode 和节点列表正确
         if (!ParseTags()) {
             MessageBoxW(NULL, L"自动修复后无法重新加载 config.json。", L"错误", MB_OK | MB_ICONERROR);
             THREAD_CLEANUP_AND_EXIT(FALSE);
         }
     }
-    
-    // (--- 移除清理宏定义 ---)
     #undef THREAD_CLEANUP_AND_EXIT
-
-    // 确保启动前 g_isExiting 为 false
     g_isExiting = FALSE;
     StartSingBox();
-    
-    // --- 成功：通知主线程 ---
     PostMessageW(hWndMain, WM_INIT_COMPLETE, (WPARAM)TRUE, (LPARAM)0);
     return 0;
 }
-
-
-// =========================================================================
-// (--- 已修改：移除图标加载失败弹窗 ---)
-// (--- 已重构：异步启动 ---)
-// =========================================================================
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdShow) {
     wchar_t mutexName[128];
     wchar_t guidString[40];
 
     g_hFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"宋体");
-
-    // --- 新增：创建日志等宽字体 ---
     hLogFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     if (hLogFont == NULL) {
-        hLogFont = (HFONT)GetStockObject(SYSTEM_FIXED_FONT); // 备用字体
+        hLogFont = (HFONT)GetStockObject(SYSTEM_FIXED_FONT);
     }
-    // --- 新增结束 ---
 
     wsprintfW(guidString, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
         APP_GUID.Data1, APP_GUID.Data2, APP_GUID.Data3,
@@ -3156,7 +2518,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         MessageBoxW(NULL, L"程序已在运行。", L"提示", MB_OK | MB_ICONINFORMATION);
         if (hMutex) CloseHandle(hMutex);
         if (g_hFont) DeleteObject(g_hFont);
-        if (hLogFont) DeleteObject(hLogFont); // 退出前清理
+        if (hLogFont) DeleteObject(hLogFont);
         return 0;
     }
 
@@ -3177,12 +2539,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         wcsncpy(g_iniFilePath, L"set.ini", MAX_PATH - 1);
     }
 
-    // --- (修改) 启动逻辑 ---
-    
-    // (--- 提前加载设置 ---)
     LoadSettings();
 
-    // 1. 创建窗口
     const wchar_t* CLASS_NAME = L"TrayWindowClass";
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = WndProc;
@@ -3190,7 +2548,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     wc.lpszClassName = CLASS_NAME;
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCE(1));
     if (!wc.hIcon) {
-        // (--- 已移除图标加载失败的提示 ---)
         wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     }
     RegisterClassW(&wc);
@@ -3201,39 +2558,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         return 1;
     }
 
-    // 2. 注册热键
     if (g_hotkeyVk != 0 || g_hotkeyModifiers != 0) {
         if (!RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, g_hotkeyModifiers, g_hotkeyVk)) {
             MessageBoxW(NULL, L"注册全局快捷键失败！\n可能已被其他程序占用。", L"快捷键错误", MB_OK | MB_ICONWARNING);
         }
     }
 
-    // 3. 准备托盘图标数据
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = wc.hIcon;
-    wcsncpy(nid.szTip, L"程序正在启动...", ARRAYSIZE(nid.szTip) - 1); // (--- 初始提示 ---)
+    wcsncpy(nid.szTip, L"程序正在启动...", ARRAYSIZE(nid.szTip) - 1);
     nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
-    // 4. 如果设置可见，则显示托盘
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
 
-    // =========================================================================
-    // (--- 启动逻辑 已重构 ---)
-    // =========================================================================
-
-    // (--- 移除 wWinMain 中的所有阻塞逻辑 ---)
-    // (--- 移除 DownloadConfig, ParseTags, FixDuplicateTags, StartSingBox ---)
-
-    // (--- 新增：启动初始化工作线程 ---)
     HANDLE hInitThread = CreateThread(NULL, 0, InitThread, (LPVOID)hwnd, 0, NULL);
     if (hInitThread) {
-        // 立即关闭句柄，让线程在完成后自行销毁
         CloseHandle(hInitThread); 
     } else {
         ShowError(L"致命错误", L"无法创建启动线程。");
@@ -3244,25 +2589,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
         DestroyWindow(hwnd);
         return 1;
     }
-    
-    // =========================================================================
-    // (--- 立即进入消息循环，程序保持响应 ---)
-    // =========================================================================
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
-        // --- 新增：检查是否是日志窗口的消息 ---
-        // IsDialogMessage 允许在日志窗口的 EDIT 控件中使用 TAB 键
         if (hLogViewerWnd == NULL || !IsDialogMessageW(hLogViewerWnd, &msg)) {
              TranslateMessage(&msg);
              DispatchMessage(&msg);
         }
-        // --- 新增结束 ---
     }
     
-    // 程序退出前最后一次清理
     if (!g_isExiting) {
-         g_isExiting = TRUE; // 确保在 GetMessage 循环外退出时也标记
+         g_isExiting = TRUE;
          StopSingBox(); 
     }
     
@@ -3272,12 +2609,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmdLine, int 
     CleanupDynamicNodes();
     if (hMutex) CloseHandle(hMutex);
     UnregisterClassW(CLASS_NAME, hInstance);
-    
-    // --- 新增：清理字体 ---
     if (hLogFont) DeleteObject(hLogFont);
-    // --- 新增结束 ---
-    
     if (g_hFont) DeleteObject(g_hFont);
     return (int)msg.wParam;
-
 }
