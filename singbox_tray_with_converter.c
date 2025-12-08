@@ -16,6 +16,7 @@
 #include <commctrl.h>
 #include <time.h>
 
+// 确保 cJSON.c 在同一目录下，或者在编译命令中包含它
 #include "cJSON.c"
 
 #ifndef NIF_GUID
@@ -94,7 +95,7 @@ wchar_t g_configUrl[2048] = {0};
 HANDLE hMonitorThread = NULL;
 HANDLE hLogMonitorThread = NULL;
 HANDLE hChildStd_OUT_Rd_Global = NULL;
-BOOL g_isExiting = FALSE;
+volatile BOOL g_isExiting = FALSE; // 使用 volatile 确保多线程可见性
 
 HWND hLogViewerWnd = NULL;
 HFONT hLogFont = NULL;
@@ -105,6 +106,7 @@ typedef struct {
     BOOL success;
 } MODIFY_NODE_PARAMS;
 
+// 函数声明
 void ShowTrayTip(const wchar_t* title, const wchar_t* message);
 void ShowError(const wchar_t* title, const wchar_t* message);
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize);
@@ -458,6 +460,7 @@ DWORD WINAPI MonitorThread(LPVOID lpParam) {
     return 0;
 }
 
+// [重构] 修复了内存泄漏隐患的日志监控线程
 DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
     char readBuf[4096];
     char lineBuf[8192] = {0};
@@ -473,18 +476,22 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
             break;
         }
         readBuf[dwRead] = '\0';
-        if (hLogViewerWnd != NULL && !g_isExiting) {
+        
+        // 关键修复：确保不向已销毁的窗口发送消息，且在发送失败时释放内存
+        if (!g_isExiting && hLogViewerWnd != NULL && IsWindow(hLogViewerWnd)) {
             int wideLen = MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, NULL, 0);
             if (wideLen > 0) {
                 wchar_t* pWideBuf = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
                 if (pWideBuf) {
                     MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, pWideBuf, wideLen);
+                    // 尝试发送，如果 PostMessage 失败（例如队列满或窗口刚被销毁），必须手动释放
                     if (!PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)pWideBuf)) {
                         free(pWideBuf);
                     }
                 }
             }
         }
+        
         strncat(lineBuf, readBuf, sizeof(lineBuf) - strlen(lineBuf) - 1);
         if (g_isExiting) {
             continue;
@@ -507,6 +514,8 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
             }
         }
     }
+    // 线程结束时关闭其持有的管道句柄
+    CloseHandle(hPipe);
     return 0;
 }
 
@@ -859,6 +868,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t* pMessage = (wchar_t*)lParam;
         if (pTitle && pMessage) {
             ShowTrayTip(pTitle, pMessage);
+            // 这里处理了 PostTrayTip 发送过来的内存
             free(pTitle);
             free(pMessage);
         }
@@ -1080,7 +1090,13 @@ BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNe
     return FALSE;
 }
 
+// [重构] 修复了内存泄漏隐患的 PostTrayTip
 void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message) {
+    // 关键修复：程序退出或窗口无效时，不再分配内存
+    if (g_isExiting || !IsWindow(hWndMain)) {
+        return;
+    }
+
     size_t titleLen = wcslen(title) + 1;
     size_t msgLen = wcslen(message) + 1;
     wchar_t* pTitle = (wchar_t*)malloc(titleLen * sizeof(wchar_t));
@@ -1094,11 +1110,14 @@ void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message) {
     pTitle[titleLen - 1] = L'\0';
     wcsncpy(pMessage, message, msgLen);
     pMessage[msgLen - 1] = L'\0';
+    
+    // 关键修复：尝试发送消息，若失败则手动释放内存
     if (!PostMessageW(hWndMain, WM_SHOW_TRAY_TIP, (WPARAM)pTitle, (LPARAM)pMessage)) {
         free(pTitle);
         free(pMessage);
     }
 }
+
 BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath) {
     wchar_t cmdLine[4096];
     wchar_t fullSavePath[MAX_PATH];
@@ -1444,15 +1463,14 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     return 0;
 }
-
+// [重构] 修复了 GDI 句柄泄漏的 ModifyNodeWndProc
 LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit, hOkBtn, hCancelBtn, hFormatBtn, hLabel;
-    static MODIFY_NODE_PARAMS* pParams = NULL;
 
     switch (msg) {
         case WM_CREATE: {
             CREATESTRUCT* pCreate = (CREATESTRUCT*)lParam;
-            pParams = (MODIFY_NODE_PARAMS*)pCreate->lpCreateParams;
+            MODIFY_NODE_PARAMS* pParams = (MODIFY_NODE_PARAMS*)pCreate->lpCreateParams;
             SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)pParams);
 
             hLabel = CreateWindowW(L"STATIC", L"节点内容 (JSON格式):", WS_CHILD | WS_VISIBLE, 15, 10, 200, 20, hWnd, NULL, NULL, NULL);
@@ -1466,8 +1484,12 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             SendMessage(hOkBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hCancelBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
+            // [修复] 创建字体并保存句柄到窗口属性，防止泄漏
             HFONT hJsonFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
-            if(hJsonFont) SendMessage(hEdit, WM_SETFONT, (WPARAM)hJsonFont, TRUE);
+            if(hJsonFont) {
+                SendMessage(hEdit, WM_SETFONT, (WPARAM)hJsonFont, TRUE);
+                SetPropW(hWnd, L"JsonFont", (HANDLE)hJsonFont);
+            }
 
             char* contentMb = GetNodeContentByTag(pParams->oldTag);
             if (contentMb) {
@@ -1562,6 +1584,7 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                         free(newContentMb);
                         break;
                     }
+                    MODIFY_NODE_PARAMS* pParams = (MODIFY_NODE_PARAMS*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
                     int newTagWLen = MultiByteToWideChar(CP_UTF8, 0, newTagJson->valuestring, -1, NULL, 0);
                     wchar_t* newTagW = (wchar_t*)malloc(newTagWLen * sizeof(wchar_t));
                     if (newTagW) {
@@ -1582,7 +1605,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                     }
                     cJSON_Delete(newNodeJson);
                     if (UpdateNodeByTag(pParams->oldTag, newContentMb)) {
-                        pParams = (MODIFY_NODE_PARAMS*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
                         pParams->success = TRUE;
                         DestroyWindow(hWnd);
                     } else {
@@ -1592,22 +1614,28 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                     free(newContentMb);
                     break;
                 }
-                case ID_MODIFY_CANCEL_BTN:
-                    pParams = (MODIFY_NODE_PARAMS*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
-                    pParams->success = FALSE;
+                case ID_MODIFY_CANCEL_BTN: {
+                    MODIFY_NODE_PARAMS* pParams = (MODIFY_NODE_PARAMS*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
+                    if(pParams) pParams->success = FALSE;
                     DestroyWindow(hWnd);
                     break;
+                }
             }
             break;
         }
-        case WM_CLOSE:
-            pParams = (MODIFY_NODE_PARAMS*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
-            pParams->success = FALSE;
+        case WM_CLOSE: {
+            MODIFY_NODE_PARAMS* pParams = (MODIFY_NODE_PARAMS*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
+            if(pParams) pParams->success = FALSE;
             DestroyWindow(hWnd);
             break;
+        }
         case WM_DESTROY: {
-             HFONT hFont = (HFONT)SendMessage(GetDlgItem(hWnd, ID_MODIFY_EDIT_CONTENT), WM_GETFONT, 0, 0);
-             if (hFont) DeleteObject(hFont);
+             // [修复] 从属性中获取并删除字体对象
+             HANDLE hFont = GetPropW(hWnd, L"JsonFont");
+             if (hFont) {
+                 DeleteObject((HFONT)hFont);
+                 RemovePropW(hWnd, L"JsonFont");
+             }
              break;
         }
         default:
@@ -1616,6 +1644,7 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
     return 0;
 }
 
+// [重构] 修复了 GDI 句柄泄漏的 AddNodeWndProc
 LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit, hOkBtn, hCancelBtn, hFormatBtn, hLabel;
 
@@ -1630,8 +1659,14 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessage(hFormatBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hOkBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hCancelBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            
+            // [修复] 创建字体并保存句柄
             HFONT hJsonFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
-            if(hJsonFont) SendMessage(hEdit, WM_SETFONT, (WPARAM)hJsonFont, TRUE);
+            if(hJsonFont) {
+                SendMessage(hEdit, WM_SETFONT, (WPARAM)hJsonFont, TRUE);
+                SetPropW(hWnd, L"JsonFont", (HANDLE)hJsonFont);
+            }
+
             RECT rc, rcOwner;
             GetWindowRect(hWnd, &rc);
             GetWindowRect(GetDesktopWindow(), &rcOwner);
@@ -1741,8 +1776,12 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hWnd);
             break;
         case WM_DESTROY: {
-             HFONT hFont = (HFONT)SendMessage(GetDlgItem(hWnd, ID_ADD_EDIT_CONTENT), WM_GETFONT, 0, 0);
-             if (hFont) DeleteObject(hFont);
+             // [修复] 从属性中获取并删除字体对象
+             HANDLE hFont = GetPropW(hWnd, L"JsonFont");
+             if (hFont) {
+                 DeleteObject((HFONT)hFont);
+                 RemovePropW(hWnd, L"JsonFont");
+             }
              break;
         }
         default:
@@ -2342,6 +2381,7 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
                 }
                 SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
                 SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)pLogChunk);
+                // [注意] 此处释放是必须的，配合Part 1的修改，只有窗口存在时才会收到此消息，因此是安全的
                 free(pLogChunk);
             }
             break;
