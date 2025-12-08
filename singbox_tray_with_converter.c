@@ -15,6 +15,7 @@
 #include <wininet.h>
 #include <commctrl.h>
 #include <time.h>
+#include <ctype.h> // [新增] 用于 isxdigit
 
 // 确保 cJSON.c 在同一目录下，或者在编译命令中包含它
 #include "cJSON.c"
@@ -42,6 +43,7 @@ static const GUID APP_GUID = { 0xbfd8a583, 0x662a, 0x4fe3, { 0x97, 0x84, 0xfa, 0
 #define ID_TRAY_SETTINGS 1005
 #define ID_TRAY_MANAGE_NODES 1006
 #define ID_TRAY_SHOW_CONSOLE 1007
+#define ID_TRAY_IMPORT_CLIPBOARD 1008 // [新增] 剪贴板导入菜单ID
 #define ID_TRAY_NODE_BASE 2000
 
 #define ID_NODEMGR_LISTBOX 3001
@@ -83,7 +85,7 @@ int nodeCapacity = 0;
 wchar_t currentNode[64] = L"";
 int httpPort = 0;
 int socksPort = 0;
-int apiPort = 0; // [新增] 用于存储 API 端口
+int apiPort = 0; // API 端口
 
 const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
@@ -96,7 +98,7 @@ wchar_t g_configUrl[2048] = {0};
 HANDLE hMonitorThread = NULL;
 HANDLE hLogMonitorThread = NULL;
 HANDLE hChildStd_OUT_Rd_Global = NULL;
-volatile BOOL g_isExiting = FALSE; 
+volatile BOOL g_isExiting = FALSE;
 
 HWND hLogViewerWnd = NULL;
 HFONT hLogFont = NULL;
@@ -138,9 +140,12 @@ BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNe
 BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath);
 void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message);
 
-// [新增] API 相关函数声明
+// API 相关函数
 BOOL ReloadSingBoxConfig(const wchar_t* configPath);
 BOOL SendApiRequest(const wchar_t* method, const wchar_t* path, const char* jsonBody);
+
+// 剪贴板导入相关函数
+BOOL ImportFromClipboard();
 
 void OpenNodeManagerWindow();
 LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -157,6 +162,405 @@ int FixDuplicateTags();
 
 void OpenLogViewerWindow();
 LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// =================================================================================
+// [新增] 剪贴板导入工具函数与解析器
+// =================================================================================
+
+// Base64 解码表
+static const unsigned char base64_table[256] = {
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,62,0,0,0,63,52,53,54,55,56,57,58,59,60,61,0,0,0,0,0,0,
+    0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,0,0,0,0,0,
+    0,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,0,0,0,0,0
+};
+
+// Base64 解码函数
+unsigned char* Base64Decode(const char* src, size_t* out_len) {
+    size_t len = strlen(src);
+    // 处理 Padding
+    if (len > 0 && src[len-1] == '=') len--;
+    if (len > 0 && src[len-1] == '=') len--;
+
+    *out_len = (len * 3) / 4;
+    unsigned char* out = (unsigned char*)malloc(*out_len + 1);
+    if (!out) return NULL;
+    
+    for (size_t i = 0, j = 0; i < len;) {
+        uint32_t a = (i < len) ? base64_table[(unsigned char)src[i++]] : 0;
+        uint32_t b = (i < len) ? base64_table[(unsigned char)src[i++]] : 0;
+        uint32_t c = (i < len) ? base64_table[(unsigned char)src[i++]] : 0;
+        uint32_t d = (i < len) ? base64_table[(unsigned char)src[i++]] : 0;
+
+        uint32_t triple = (a << 18) | (b << 12) | (c << 6) | d;
+
+        if (j < *out_len) out[j++] = (triple >> 16) & 0xFF;
+        if (j < *out_len) out[j++] = (triple >> 8) & 0xFF;
+        if (j < *out_len) out[j++] = triple & 0xFF;
+    }
+    out[*out_len] = '\0';
+    return out;
+}
+
+// URL 解码函数 (%20 -> Space)
+void UrlDecode(char* dst, const char* src) {
+    char a, b;
+    while (*src) {
+        if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
+            if (a >= 'a') a -= 'a' - 'A';
+            if (a >= 'A') a -= ('A' - 10);
+            else a -= '0';
+            if (b >= 'a') b -= 'a' - 'A';
+            if (b >= 'A') b -= ('A' - 10);
+            else b -= '0';
+            *dst++ = 16 * a + b;
+            src += 3;
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
+// 从剪贴板获取文本
+char* GetClipboardText() {
+    if (!OpenClipboard(NULL)) return NULL;
+    HANDLE hData = GetClipboardData(CF_TEXT);
+    if (hData == NULL) { CloseClipboard(); return NULL; }
+    char* pszText = (char*)GlobalLock(hData);
+    if (pszText == NULL) { CloseClipboard(); return NULL; }
+    char* text = strdup(pszText);
+    GlobalUnlock(hData);
+    CloseClipboard();
+    return text;
+}
+
+// 从 URL query 中获取参数值
+char* GetQueryParam(const char* query, const char* key) {
+    if (!query || !key) return NULL;
+    char keyEq[128];
+    snprintf(keyEq, sizeof(keyEq), "%s=", key);
+    const char* start = strstr(query, keyEq);
+    if (!start) return NULL;
+    // 确保匹配的是 key 开头
+    if (start != query && *(start - 1) != '&' && *(start - 1) != '?') {
+        return GetQueryParam(start + 1, key); 
+    }
+    start += strlen(keyEq);
+    const char* end = strchr(start, '&');
+    const char* hash = strchr(start, '#');
+    if (hash && (!end || hash < end)) end = hash;
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (len == 0) return NULL;
+    char* value = (char*)malloc(len + 1);
+    strncpy(value, start, len);
+    value[len] = '\0';
+    char* decoded = (char*)malloc(len + 1);
+    UrlDecode(decoded, value);
+    free(value);
+    return decoded;
+}
+
+// 1. 解析 VMess
+cJSON* ParseVmess(const char* link) {
+    if (strncmp(link, "vmess://", 8) != 0) return NULL;
+    const char* base64Content = link + 8;
+    size_t len;
+    unsigned char* decoded = Base64Decode(base64Content, &len);
+    if (!decoded) return NULL;
+    cJSON* vmessJson = cJSON_Parse((const char*)decoded);
+    free(decoded);
+    if (!vmessJson) return NULL;
+
+    cJSON* outbound = cJSON_CreateObject();
+    cJSON_AddStringToObject(outbound, "type", "vmess");
+    
+    cJSON* ps = cJSON_GetObjectItem(vmessJson, "ps");
+    cJSON* add = cJSON_GetObjectItem(vmessJson, "add");
+    cJSON* port = cJSON_GetObjectItem(vmessJson, "port");
+    cJSON* id = cJSON_GetObjectItem(vmessJson, "id");
+    cJSON* aid = cJSON_GetObjectItem(vmessJson, "aid");
+    cJSON* scy = cJSON_GetObjectItem(vmessJson, "scy");
+    cJSON* net = cJSON_GetObjectItem(vmessJson, "net");
+    cJSON* host = cJSON_GetObjectItem(vmessJson, "host");
+    cJSON* path = cJSON_GetObjectItem(vmessJson, "path");
+    cJSON* tls = cJSON_GetObjectItem(vmessJson, "tls");
+    cJSON* sni = cJSON_GetObjectItem(vmessJson, "sni");
+
+    if (cJSON_IsString(ps)) cJSON_AddStringToObject(outbound, "tag", ps->valuestring);
+    else cJSON_AddStringToObject(outbound, "tag", "VMess-Import");
+    
+    if (cJSON_IsString(add)) cJSON_AddStringToObject(outbound, "server", add->valuestring);
+    if (cJSON_IsNumber(port)) cJSON_AddNumberToObject(outbound, "server_port", port->valueint);
+    else if (cJSON_IsString(port)) cJSON_AddNumberToObject(outbound, "server_port", atoi(port->valuestring));
+    
+    if (cJSON_IsString(id)) cJSON_AddStringToObject(outbound, "uuid", id->valuestring);
+    if (cJSON_IsNumber(aid)) cJSON_AddNumberToObject(outbound, "alter_id", aid->valueint);
+    else if (cJSON_IsString(aid)) cJSON_AddNumberToObject(outbound, "alter_id", atoi(aid->valuestring));
+    else cJSON_AddNumberToObject(outbound, "alter_id", 0);
+
+    if (cJSON_IsString(scy) && strlen(scy->valuestring) > 0) 
+        cJSON_AddStringToObject(outbound, "security", scy->valuestring);
+    else 
+        cJSON_AddStringToObject(outbound, "security", "auto");
+
+    const char* netType = (cJSON_IsString(net)) ? net->valuestring : "tcp";
+    if (strcmp(netType, "ws") == 0) {
+        cJSON* transport = cJSON_CreateObject();
+        cJSON_AddStringToObject(transport, "type", "ws");
+        if (cJSON_IsString(path) && strlen(path->valuestring) > 0)
+            cJSON_AddStringToObject(transport, "path", path->valuestring);
+        if (cJSON_IsString(host) && strlen(host->valuestring) > 0) {
+            cJSON* headers = cJSON_CreateObject();
+            cJSON_AddStringToObject(headers, "Host", host->valuestring);
+            cJSON_AddItemToObject(transport, "headers", headers);
+        }
+        cJSON_AddItemToObject(outbound, "transport", transport);
+    } 
+    else if (strcmp(netType, "grpc") == 0) {
+        cJSON* transport = cJSON_CreateObject();
+        cJSON_AddStringToObject(transport, "type", "grpc");
+        if (cJSON_IsString(path) && strlen(path->valuestring) > 0)
+            cJSON_AddStringToObject(transport, "service_name", path->valuestring);
+        cJSON_AddItemToObject(outbound, "transport", transport);
+    }
+
+    if ((cJSON_IsString(tls) && strcmp(tls->valuestring, "tls") == 0)) {
+        cJSON* tlsObj = cJSON_CreateObject();
+        cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+        if (cJSON_IsString(sni) && strlen(sni->valuestring) > 0) {
+            cJSON_AddStringToObject(tlsObj, "server_name", sni->valuestring);
+        } else if (cJSON_IsString(host) && strlen(host->valuestring) > 0) {
+            cJSON_AddStringToObject(tlsObj, "server_name", host->valuestring);
+        }
+        cJSON_AddItemToObject(outbound, "tls", tlsObj);
+    }
+    cJSON_Delete(vmessJson);
+    return outbound;
+}
+
+// 2. 解析 VLESS 和 Trojan
+cJSON* ParseVlessOrTrojan(const char* link) {
+    char protocol[16] = {0};
+    if (strncmp(link, "vless://", 8) == 0) strcpy(protocol, "vless");
+    else if (strncmp(link, "trojan://", 9) == 0) strcpy(protocol, "trojan");
+    else return NULL;
+
+    const char* p = link + (strlen(protocol) + 3);
+    const char* at = strchr(p, '@');
+    if (!at) return NULL;
+
+    int uuidLen = (int)(at - p);
+    char* uuid = (char*)malloc(uuidLen + 1);
+    strncpy(uuid, p, uuidLen);
+    uuid[uuidLen] = '\0';
+
+    p = at + 1;
+    const char* colon = strchr(p, ':');
+    const char* qMark = strchr(p, '?');
+    const char* hash = strchr(p, '#');
+    const char* portStart = colon ? colon + 1 : NULL;
+    const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
+    int hostLen = (int)(hostEnd - p);
+    char* host = (char*)malloc(hostLen + 1);
+    strncpy(host, p, hostLen);
+    host[hostLen] = '\0';
+
+    int portNum = 443;
+    if (portStart) portNum = atoi(portStart);
+
+    char* tag = NULL;
+    if (hash) {
+        size_t tagLen = strlen(hash + 1);
+        tag = (char*)malloc(tagLen + 1);
+        UrlDecode(tag, hash + 1);
+    } else {
+        tag = strdup(protocol);
+    }
+
+    const char* query = qMark ? qMark + 1 : NULL;
+    cJSON* outbound = cJSON_CreateObject();
+    cJSON_AddStringToObject(outbound, "type", protocol);
+    cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", host);
+    cJSON_AddNumberToObject(outbound, "server_port", portNum);
+
+    if (strcmp(protocol, "vless") == 0) {
+        cJSON_AddStringToObject(outbound, "uuid", uuid);
+        char* flow = GetQueryParam(query, "flow");
+        if (flow) { cJSON_AddStringToObject(outbound, "flow", flow); free(flow); }
+    } else {
+        cJSON_AddStringToObject(outbound, "password", uuid);
+    }
+
+    char* type = GetQueryParam(query, "type");
+    if (type) {
+        if (strcmp(type, "ws") == 0) {
+            cJSON* transport = cJSON_CreateObject();
+            cJSON_AddStringToObject(transport, "type", "ws");
+            char* path = GetQueryParam(query, "path");
+            if (path) { cJSON_AddStringToObject(transport, "path", path); free(path); }
+            char* hostHeader = GetQueryParam(query, "host");
+            if (hostHeader) {
+                cJSON* headers = cJSON_CreateObject();
+                cJSON_AddStringToObject(headers, "Host", hostHeader);
+                cJSON_AddItemToObject(transport, "headers", headers);
+                free(hostHeader);
+            }
+            cJSON_AddItemToObject(outbound, "transport", transport);
+        } else if (strcmp(type, "grpc") == 0) {
+            cJSON* transport = cJSON_CreateObject();
+            cJSON_AddStringToObject(transport, "type", "grpc");
+            char* serviceName = GetQueryParam(query, "serviceName");
+            if (serviceName) { cJSON_AddStringToObject(transport, "service_name", serviceName); free(serviceName); }
+            cJSON_AddItemToObject(outbound, "transport", transport);
+        }
+        free(type);
+    }
+
+    char* security = GetQueryParam(query, "security");
+    int tlsEnabled = 0;
+    if (security && strcmp(security, "tls") == 0) tlsEnabled = 1;
+    if (security && strcmp(security, "reality") == 0) tlsEnabled = 2;
+    if (security) free(security);
+
+    if (tlsEnabled) {
+        cJSON* tlsObj = cJSON_CreateObject();
+        cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+        char* sni = GetQueryParam(query, "sni");
+        if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
+        else cJSON_AddStringToObject(tlsObj, "server_name", host);
+
+        char* fp = GetQueryParam(query, "fp");
+        if (fp) {
+             cJSON* utls = cJSON_CreateObject();
+             cJSON_AddBoolToObject(utls, "enabled", cJSON_True);
+             cJSON_AddStringToObject(utls, "fingerprint", fp);
+             cJSON_AddItemToObject(tlsObj, "utls", utls);
+             free(fp);
+        }
+        if (tlsEnabled == 2) {
+             char* pbk = GetQueryParam(query, "pbk");
+             char* sid = GetQueryParam(query, "sid");
+             if (pbk) { 
+                 cJSON* reality = cJSON_CreateObject();
+                 cJSON_AddBoolToObject(reality, "enabled", cJSON_True);
+                 cJSON_AddStringToObject(reality, "public_key", pbk);
+                 if (sid) cJSON_AddStringToObject(reality, "short_id", sid);
+                 cJSON_AddItemToObject(tlsObj, "reality", reality);
+                 free(pbk);
+             }
+             if (sid) free(sid);
+        }
+        cJSON_AddItemToObject(outbound, "tls", tlsObj);
+    }
+    free(uuid); free(host); free(tag);
+    return outbound;
+}
+
+// 3. 解析 Shadowsocks
+cJSON* ParseShadowsocks(const char* link) {
+    if (strncmp(link, "ss://", 5) != 0) return NULL;
+    const char* p = link + 5;
+    const char* hash = strchr(p, '#');
+    char* tag = NULL;
+    if (hash) {
+        size_t tagLen = strlen(hash + 1);
+        tag = (char*)malloc(tagLen + 1);
+        UrlDecode(tag, hash + 1);
+    } else {
+        tag = strdup("SS-Import");
+    }
+
+    size_t mainLen = hash ? (size_t)(hash - p) : strlen(p);
+    char* mainPart = (char*)malloc(mainLen + 1);
+    strncpy(mainPart, p, mainLen);
+    mainPart[mainLen] = '\0';
+
+    char* at = strchr(mainPart, '@');
+    char methodPass[256] = {0};
+    char serverPort[256] = {0};
+
+    if (!at) {
+        size_t decodedLen;
+        unsigned char* decoded = Base64Decode(mainPart, &decodedLen);
+        free(mainPart);
+        if (!decoded) { free(tag); return NULL; }
+        char* decodedStr = (char*)decoded;
+        at = strchr(decodedStr, '@');
+        if (!at) { free(decoded); free(tag); return NULL; }
+        strncpy(serverPort, at + 1, sizeof(serverPort) - 1);
+        size_t credLen = at - decodedStr;
+        if (credLen >= sizeof(methodPass)) credLen = sizeof(methodPass) - 1;
+        strncpy(methodPass, decodedStr, credLen);
+        methodPass[credLen] = '\0';
+        free(decoded);
+    } else {
+        strncpy(serverPort, at + 1, sizeof(serverPort) - 1);
+        size_t credLen = at - mainPart;
+        char* credPart = (char*)malloc(credLen + 1);
+        strncpy(credPart, mainPart, credLen);
+        credPart[credLen] = '\0';
+        size_t decLen;
+        unsigned char* decodedCred = Base64Decode(credPart, &decLen);
+        if (decodedCred && strchr((char*)decodedCred, ':')) {
+             strncpy(methodPass, (char*)decodedCred, sizeof(methodPass) - 1);
+             free(decodedCred);
+        } else {
+             strncpy(methodPass, credPart, sizeof(methodPass) - 1);
+             if (decodedCred) free(decodedCred);
+        }
+        free(credPart);
+        free(mainPart);
+    }
+
+    char* colon = strrchr(serverPort, ':');
+    if (!colon) { free(tag); return NULL; }
+    int port = atoi(colon + 1);
+    *colon = '\0'; 
+
+    char* method = methodPass;
+    char* password = strchr(methodPass, ':');
+    if (!password) { free(tag); return NULL; }
+    *password = '\0'; 
+    password++; 
+
+    cJSON* outbound = cJSON_CreateObject();
+    cJSON_AddStringToObject(outbound, "type", "shadowsocks");
+    cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", serverPort);
+    cJSON_AddNumberToObject(outbound, "server_port", port);
+    cJSON_AddStringToObject(outbound, "method", method);
+    cJSON_AddStringToObject(outbound, "password", password);
+    free(tag);
+    return outbound;
+}
+
+// 主导入函数
+BOOL ImportFromClipboard() {
+    char* text = GetClipboardText();
+    if (!text) return FALSE;
+    cJSON* newNode = NULL;
+    if (strncmp(text, "vmess://", 8) == 0) newNode = ParseVmess(text);
+    else if (strncmp(text, "vless://", 8) == 0) newNode = ParseVlessOrTrojan(text);
+    else if (strncmp(text, "trojan://", 9) == 0) newNode = ParseVlessOrTrojan(text);
+    else if (strncmp(text, "ss://", 5) == 0) newNode = ParseShadowsocks(text);
+    free(text);
+
+    if (newNode) {
+        char* jsonStr = cJSON_PrintUnformatted(newNode);
+        BOOL result = AddNodeToConfig(jsonStr);
+        cJSON_Delete(newNode);
+        free(jsonStr);
+        return result;
+    }
+    return FALSE;
+}
+
+// =================================================================================
 
 void ShowTrayTip(const wchar_t* title, const wchar_t* message) {
     if (!g_isIconVisible) {
@@ -381,7 +785,7 @@ BOOL ParseTags() {
     currentNode[0] = L'\0';
     httpPort = 0;
     socksPort = 0;
-    apiPort = 0; // 重置 API 端口
+    apiPort = 0;
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) {
@@ -393,7 +797,6 @@ BOOL ParseTags() {
         return FALSE;
     }
 
-    // 解析 API 端口
     cJSON* experimental = cJSON_GetObjectItem(root, "experimental");
     if (experimental) {
         cJSON* clash_api = cJSON_GetObjectItem(experimental, "clash_api");
@@ -412,9 +815,8 @@ BOOL ParseTags() {
     cJSON* outbound = NULL;
     cJSON_ArrayForEach(outbound, outbounds) {
         cJSON* tag = cJSON_GetObjectItem(outbound, "tag");
-        cJSON* type = cJSON_GetObjectItem(outbound, "type"); // 获取节点类型
+        cJSON* type = cJSON_GetObjectItem(outbound, "type");
 
-        // [修改] 增加过滤逻辑：如果类型是 "dns"，则跳过，不添加到列表中
         if (cJSON_IsString(type) && type->valuestring && strcmp(type->valuestring, "dns") == 0) {
             continue;
         }
@@ -441,8 +843,6 @@ BOOL ParseTags() {
             }
         }
     }
-    
-    // 获取当前选中的节点 (route -> final)
     cJSON* route = cJSON_GetObjectItem(root, "route");
     if (route) {
         cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
@@ -450,8 +850,6 @@ BOOL ParseTags() {
             MultiByteToWideChar(CP_UTF8, 0, final_outbound->valuestring, -1, currentNode, ARRAYSIZE(currentNode));
         }
     }
-
-    // 解析入站端口
     cJSON* inbounds = cJSON_GetObjectItem(root, "inbounds");
     cJSON* inbound = NULL;
     cJSON_ArrayForEach(inbound, inbounds) {
@@ -549,12 +947,8 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
 }
 
 void StartSingBox() {
-    // =======================================================================
-    // [修复] 设置环境变量以兼容旧版 GeoIP/GeoSite 配置
-    // 新版 Sing-box 默认禁用了 .db 格式，需要显式开启兼容模式，否则会报错 FATAL 退出
     SetEnvironmentVariableW(L"ENABLE_DEPRECATED_GEOIP", L"true");
-    SetEnvironmentVariableW(L"ENABLE_DEPRECATED_GEOSITE", L"true"); // 预防性添加，防止 GeoSite 也报错
-    // =======================================================================
+    SetEnvironmentVariableW(L"ENABLE_DEPRECATED_GEOSITE", L"true");
 
     HANDLE hPipe_Rd_Local = NULL;
     HANDLE hPipe_Wr_Local = NULL;
@@ -625,91 +1019,47 @@ void StartSingBox() {
     }
 }
 
-// [新增] 通用 HTTP API 请求发送函数
 BOOL SendApiRequest(const wchar_t* method, const wchar_t* path, const char* jsonBody) {
     if (apiPort <= 0) return FALSE;
-
     HINTERNET hInternet = InternetOpenW(L"SingBoxTray", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
     if (!hInternet) return FALSE;
-
     HINTERNET hConnect = InternetConnectW(hInternet, L"127.0.0.1", (INTERNET_PORT)apiPort, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
-    if (!hConnect) {
-        InternetCloseHandle(hInternet);
-        return FALSE;
-    }
-
+    if (!hConnect) { InternetCloseHandle(hInternet); return FALSE; }
     HINTERNET hRequest = HttpOpenRequestW(hConnect, method, path, NULL, NULL, NULL, 0, 0);
-    if (!hRequest) {
-        InternetCloseHandle(hConnect);
-        InternetCloseHandle(hInternet);
-        return FALSE;
-    }
-
+    if (!hRequest) { InternetCloseHandle(hConnect); InternetCloseHandle(hInternet); return FALSE; }
     const wchar_t* headers = L"Content-Type: application/json";
     BOOL result = HttpSendRequestW(hRequest, headers, -1, (LPVOID)jsonBody, (DWORD)(jsonBody ? strlen(jsonBody) : 0));
-    
-    // 检查 HTTP 状态码
     if (result) {
         DWORD statusCode = 0;
         DWORD size = sizeof(statusCode);
         HttpQueryInfoW(hRequest, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &size, NULL);
-        if (statusCode < 200 || statusCode >= 300) {
-            result = FALSE;
-        }
+        if (statusCode < 200 || statusCode >= 300) { result = FALSE; }
     }
-
-    InternetCloseHandle(hRequest);
-    InternetCloseHandle(hConnect);
-    InternetCloseHandle(hInternet);
+    InternetCloseHandle(hRequest); InternetCloseHandle(hConnect); InternetCloseHandle(hInternet);
     return result;
 }
 
-// [新增] 通过 API 重载配置
 BOOL ReloadSingBoxConfig(const wchar_t* configPath) {
-    // 获取 config.json 的绝对路径
     wchar_t absPath[MAX_PATH];
-    if (GetFullPathNameW(configPath, MAX_PATH, absPath, NULL) == 0) {
-        return FALSE;
-    }
-
-    // 将宽字符路径转换为 JSON 字符串需要的格式（UTF-8，转义反斜杠）
+    if (GetFullPathNameW(configPath, MAX_PATH, absPath, NULL) == 0) return FALSE;
     char utf8Path[MAX_PATH * 3];
     WideCharToMultiByte(CP_UTF8, 0, absPath, -1, utf8Path, sizeof(utf8Path), NULL, NULL);
-
-    // 构建 JSON Body: {"path": "C:\\path\\to\\config.json"}
-    // 需要对路径中的 \ 进行转义
     char escapedPath[MAX_PATH * 4] = {0};
     int j = 0;
     for (int i = 0; utf8Path[i] != '\0'; i++) {
-        if (utf8Path[i] == '\\') {
-            escapedPath[j++] = '\\';
-            escapedPath[j++] = '\\';
-        } else {
-            escapedPath[j++] = utf8Path[i];
-        }
+        if (utf8Path[i] == '\\') { escapedPath[j++] = '\\'; escapedPath[j++] = '\\'; } else { escapedPath[j++] = utf8Path[i]; }
     }
     escapedPath[j] = '\0';
-
     char jsonBody[MAX_PATH * 5];
     snprintf(jsonBody, sizeof(jsonBody), "{\"path\": \"%s\"}", escapedPath);
-
-    // 调用 Clash API 的 reload 接口
-    // endpoint: PUT /configs?force=false (force=false 允许增量更新或平滑重载)
     return SendApiRequest(L"PUT", L"/configs?force=false", jsonBody);
 }
 
-// [重构] 切换节点函数：尝试 API 热重载，失败则重启
 void SwitchNode(const wchar_t* tag) {
-    // 1. 始终修改磁盘上的 config.json 以确保下次启动生效
     SafeReplaceOutbound(tag);
-    
-    // 2. 更新内存中的当前节点记录
     wcsncpy(currentNode, tag, ARRAYSIZE(currentNode) - 1);
     currentNode[ARRAYSIZE(currentNode)-1] = L'\0';
-
     wchar_t message[256];
-    
-    // 3. 尝试 API 热重载
     BOOL apiSuccess = FALSE;
     if (apiPort > 0) {
         if (ReloadSingBoxConfig(L"config.json")) {
@@ -717,17 +1067,13 @@ void SwitchNode(const wchar_t* tag) {
             wsprintfW(message, L"节点已切换: %s\n(API 热重载成功)", tag);
         }
     }
-
-    // 4. 根据 API 结果决定是否重启进程
     if (apiSuccess) {
         ShowTrayTip(L"切换成功", message);
     } else {
-        // API 失败或未配置 API，回退到重启进程的方式
         g_isExiting = TRUE;
         StopSingBox();
         g_isExiting = FALSE;
         StartSingBox();
-        
         wsprintfW(message, L"当前节点: %s", tag);
         ShowTrayTip(L"切换成功", message);
     }
@@ -911,6 +1257,8 @@ void UpdateMenu() {
     }
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNodeSubMenu, L"切换节点");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MANAGE_NODES, L"管理节点");
+    // [新增] 剪贴板导入菜单项
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_IMPORT_CLIPBOARD, L"剪贴板导入");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_AUTORUN, L"开机启动");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SYSTEM_PROXY, L"系统代理");
@@ -922,9 +1270,6 @@ void UpdateMenu() {
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    static time_t lastAutoRestart = 0;
-    const time_t RESTART_COOLDOWN = 60;
-
     if (msg == WM_TRAY && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)) {
         POINT pt;
         GetCursorPos(&pt);
@@ -940,9 +1285,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int id = LOWORD(wParam);
         if (id == ID_TRAY_EXIT) {
             g_isExiting = TRUE;
-            if (hLogViewerWnd != NULL) {
-                DestroyWindow(hLogViewerWnd);
-            }
+            if (hLogViewerWnd != NULL) { DestroyWindow(hLogViewerWnd); }
             UnregisterHotKey(hWnd, ID_GLOBAL_HOTKEY);
             if(g_isIconVisible) Shell_NotifyIconW(NIM_DELETE, &nid);
             if (IsSystemProxyEnabled()) SetSystemProxy(FALSE);
@@ -961,6 +1304,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             OpenNodeManagerWindow();
         } else if (id == ID_TRAY_SHOW_CONSOLE) {
             OpenLogViewerWindow();
+        } else if (id == ID_TRAY_IMPORT_CLIPBOARD) {
+            // [新增] 处理剪贴板导入
+            if (ImportFromClipboard()) {
+                ShowTrayTip(L"导入成功", L"节点已成功添加到配置文件。");
+                ParseTags(); // 重新加载 tag
+            } else {
+                MessageBoxW(hWnd, L"剪贴板中没有识别到有效的分享链接 (vmess/vless/trojan/ss)。", L"导入失败", MB_OK | MB_ICONWARNING);
+            }
         } else if (id >= ID_TRAY_NODE_BASE && id < ID_TRAY_NODE_BASE + nodeCount) {
             SwitchNode(nodeTags[id - ID_TRAY_NODE_BASE]);
         }
@@ -1064,7 +1415,6 @@ BOOL IsAutorunEnabled() {
 }
 
 void CreateDefaultConfig() {
-    // [更新] 添加 experimental 字段以支持 API 热重载
     const char* defaultConfig =
         "{\n"
         "\t\"log\": {\n"
@@ -1075,9 +1425,7 @@ void CreateDefaultConfig() {
         "\t\t\"clash_api\": {\n"
         "\t\t\t\"external_controller\": \"127.0.0.1:9090\",\n"
         "\t\t\t\"external_ui\": \"ui\",\n"
-        "\t\t\t\"secret\": \"\",\n"
-        "\t\t\t\"external_ui_download_url\": \"\",\n"
-        "\t\t\t\"external_ui_download_detour\": \"\"\n"
+        "\t\t\t\"secret\": \"\"\n"
         "\t\t}\n"
         "\t},\n"
         "\t\"dns\": {\n"
@@ -1534,7 +1882,6 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                         RefreshNodeListBox(hListBox);
 
                         if (wasCurrentNode) {
-                            // [重构] 尝试热重载
                             BOOL reloaded = FALSE;
                             if (apiPort > 0) {
                                  if (ReloadSingBoxConfig(L"config.json")) {
@@ -1542,7 +1889,6 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                                      MessageBoxW(hWnd, L"当前节点已修改，核心已通过 API 热重载配置。", L"提示", MB_OK | MB_ICONINFORMATION);
                                  }
                             }
-                            
                             if (!reloaded) {
                                 MessageBoxW(hWnd, L"检测到当前活动节点已被修改，核心将自动重启以应用更改。", L"提示", MB_OK | MB_ICONINFORMATION);
                                 g_isExiting = TRUE;
