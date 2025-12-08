@@ -83,6 +83,7 @@ int nodeCapacity = 0;
 wchar_t currentNode[64] = L"";
 int httpPort = 0;
 int socksPort = 0;
+int apiPort = 0; // [新增] 用于存储 API 端口
 
 const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
@@ -95,7 +96,7 @@ wchar_t g_configUrl[2048] = {0};
 HANDLE hMonitorThread = NULL;
 HANDLE hLogMonitorThread = NULL;
 HANDLE hChildStd_OUT_Rd_Global = NULL;
-volatile BOOL g_isExiting = FALSE; // 使用 volatile 确保多线程可见性
+volatile BOOL g_isExiting = FALSE; 
 
 HWND hLogViewerWnd = NULL;
 HFONT hLogFont = NULL;
@@ -136,6 +137,10 @@ BOOL WriteBufferToFileW(const wchar_t* filename, const char* buffer, long fileSi
 BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNewFileName);
 BOOL DownloadConfig(HWND hWndMain, const wchar_t* url, const wchar_t* savePath);
 void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message);
+
+// [新增] API 相关函数声明
+BOOL ReloadSingBoxConfig(const wchar_t* configPath);
+BOOL SendApiRequest(const wchar_t* method, const wchar_t* path, const char* jsonBody);
 
 void OpenNodeManagerWindow();
 LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -376,6 +381,7 @@ BOOL ParseTags() {
     currentNode[0] = L'\0';
     httpPort = 0;
     socksPort = 0;
+    apiPort = 0; // 重置 API 端口
     char* buffer = NULL;
     long size = 0;
     if (!ReadFileToBuffer(L"config.json", &buffer, &size)) {
@@ -386,10 +392,33 @@ BOOL ParseTags() {
         free(buffer);
         return FALSE;
     }
+
+    // 解析 API 端口
+    cJSON* experimental = cJSON_GetObjectItem(root, "experimental");
+    if (experimental) {
+        cJSON* clash_api = cJSON_GetObjectItem(experimental, "clash_api");
+        if (clash_api) {
+            cJSON* ext_ctrl = cJSON_GetObjectItem(clash_api, "external_controller");
+            if (cJSON_IsString(ext_ctrl) && ext_ctrl->valuestring) {
+                const char* portStr = strrchr(ext_ctrl->valuestring, ':');
+                if (portStr) {
+                    apiPort = atoi(portStr + 1);
+                }
+            }
+        }
+    }
+
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* outbound = NULL;
     cJSON_ArrayForEach(outbound, outbounds) {
         cJSON* tag = cJSON_GetObjectItem(outbound, "tag");
+        cJSON* type = cJSON_GetObjectItem(outbound, "type"); // 获取节点类型
+
+        // [修改] 增加过滤逻辑：如果类型是 "dns"，则跳过，不添加到列表中
+        if (cJSON_IsString(type) && type->valuestring && strcmp(type->valuestring, "dns") == 0) {
+            continue;
+        }
+
         if (cJSON_IsString(tag) && tag->valuestring) {
             if (nodeCount >= nodeCapacity) {
                 int newCapacity = (nodeCapacity == 0) ? 10 : nodeCapacity * 2;
@@ -412,6 +441,8 @@ BOOL ParseTags() {
             }
         }
     }
+    
+    // 获取当前选中的节点 (route -> final)
     cJSON* route = cJSON_GetObjectItem(root, "route");
     if (route) {
         cJSON* final_outbound = cJSON_GetObjectItem(route, "final");
@@ -419,6 +450,8 @@ BOOL ParseTags() {
             MultiByteToWideChar(CP_UTF8, 0, final_outbound->valuestring, -1, currentNode, ARRAYSIZE(currentNode));
         }
     }
+
+    // 解析入站端口
     cJSON* inbounds = cJSON_GetObjectItem(root, "inbounds");
     cJSON* inbound = NULL;
     cJSON_ArrayForEach(inbound, inbounds) {
@@ -460,7 +493,6 @@ DWORD WINAPI MonitorThread(LPVOID lpParam) {
     return 0;
 }
 
-// [重构] 修复了内存泄漏隐患的日志监控线程
 DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
     char readBuf[4096];
     char lineBuf[8192] = {0};
@@ -477,14 +509,12 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
         }
         readBuf[dwRead] = '\0';
         
-        // 关键修复：确保不向已销毁的窗口发送消息，且在发送失败时释放内存
         if (!g_isExiting && hLogViewerWnd != NULL && IsWindow(hLogViewerWnd)) {
             int wideLen = MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, NULL, 0);
             if (wideLen > 0) {
                 wchar_t* pWideBuf = (wchar_t*)malloc(wideLen * sizeof(wchar_t));
                 if (pWideBuf) {
                     MultiByteToWideChar(CP_UTF8, 0, readBuf, -1, pWideBuf, wideLen);
-                    // 尝试发送，如果 PostMessage 失败（例如队列满或窗口刚被销毁），必须手动释放
                     if (!PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)pWideBuf)) {
                         free(pWideBuf);
                     }
@@ -514,12 +544,18 @@ DWORD WINAPI LogMonitorThread(LPVOID lpParam) {
             }
         }
     }
-    // 线程结束时关闭其持有的管道句柄
     CloseHandle(hPipe);
     return 0;
 }
 
 void StartSingBox() {
+    // =======================================================================
+    // [修复] 设置环境变量以兼容旧版 GeoIP/GeoSite 配置
+    // 新版 Sing-box 默认禁用了 .db 格式，需要显式开启兼容模式，否则会报错 FATAL 退出
+    SetEnvironmentVariableW(L"ENABLE_DEPRECATED_GEOIP", L"true");
+    SetEnvironmentVariableW(L"ENABLE_DEPRECATED_GEOSITE", L"true"); // 预防性添加，防止 GeoSite 也报错
+    // =======================================================================
+
     HANDLE hPipe_Rd_Local = NULL;
     HANDLE hPipe_Wr_Local = NULL;
     SECURITY_ATTRIBUTES sa;
@@ -589,17 +625,112 @@ void StartSingBox() {
     }
 }
 
+// [新增] 通用 HTTP API 请求发送函数
+BOOL SendApiRequest(const wchar_t* method, const wchar_t* path, const char* jsonBody) {
+    if (apiPort <= 0) return FALSE;
+
+    HINTERNET hInternet = InternetOpenW(L"SingBoxTray", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    if (!hInternet) return FALSE;
+
+    HINTERNET hConnect = InternetConnectW(hInternet, L"127.0.0.1", (INTERNET_PORT)apiPort, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConnect) {
+        InternetCloseHandle(hInternet);
+        return FALSE;
+    }
+
+    HINTERNET hRequest = HttpOpenRequestW(hConnect, method, path, NULL, NULL, NULL, 0, 0);
+    if (!hRequest) {
+        InternetCloseHandle(hConnect);
+        InternetCloseHandle(hInternet);
+        return FALSE;
+    }
+
+    const wchar_t* headers = L"Content-Type: application/json";
+    BOOL result = HttpSendRequestW(hRequest, headers, -1, (LPVOID)jsonBody, (DWORD)(jsonBody ? strlen(jsonBody) : 0));
+    
+    // 检查 HTTP 状态码
+    if (result) {
+        DWORD statusCode = 0;
+        DWORD size = sizeof(statusCode);
+        HttpQueryInfoW(hRequest, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &size, NULL);
+        if (statusCode < 200 || statusCode >= 300) {
+            result = FALSE;
+        }
+    }
+
+    InternetCloseHandle(hRequest);
+    InternetCloseHandle(hConnect);
+    InternetCloseHandle(hInternet);
+    return result;
+}
+
+// [新增] 通过 API 重载配置
+BOOL ReloadSingBoxConfig(const wchar_t* configPath) {
+    // 获取 config.json 的绝对路径
+    wchar_t absPath[MAX_PATH];
+    if (GetFullPathNameW(configPath, MAX_PATH, absPath, NULL) == 0) {
+        return FALSE;
+    }
+
+    // 将宽字符路径转换为 JSON 字符串需要的格式（UTF-8，转义反斜杠）
+    char utf8Path[MAX_PATH * 3];
+    WideCharToMultiByte(CP_UTF8, 0, absPath, -1, utf8Path, sizeof(utf8Path), NULL, NULL);
+
+    // 构建 JSON Body: {"path": "C:\\path\\to\\config.json"}
+    // 需要对路径中的 \ 进行转义
+    char escapedPath[MAX_PATH * 4] = {0};
+    int j = 0;
+    for (int i = 0; utf8Path[i] != '\0'; i++) {
+        if (utf8Path[i] == '\\') {
+            escapedPath[j++] = '\\';
+            escapedPath[j++] = '\\';
+        } else {
+            escapedPath[j++] = utf8Path[i];
+        }
+    }
+    escapedPath[j] = '\0';
+
+    char jsonBody[MAX_PATH * 5];
+    snprintf(jsonBody, sizeof(jsonBody), "{\"path\": \"%s\"}", escapedPath);
+
+    // 调用 Clash API 的 reload 接口
+    // endpoint: PUT /configs?force=false (force=false 允许增量更新或平滑重载)
+    return SendApiRequest(L"PUT", L"/configs?force=false", jsonBody);
+}
+
+// [重构] 切换节点函数：尝试 API 热重载，失败则重启
 void SwitchNode(const wchar_t* tag) {
+    // 1. 始终修改磁盘上的 config.json 以确保下次启动生效
     SafeReplaceOutbound(tag);
+    
+    // 2. 更新内存中的当前节点记录
     wcsncpy(currentNode, tag, ARRAYSIZE(currentNode) - 1);
     currentNode[ARRAYSIZE(currentNode)-1] = L'\0';
-    g_isExiting = TRUE;
-    StopSingBox();
-    g_isExiting = FALSE;
-    StartSingBox();
+
     wchar_t message[256];
-    wsprintfW(message, L"当前节点: %s", tag);
-    ShowTrayTip(L"切换成功", message);
+    
+    // 3. 尝试 API 热重载
+    BOOL apiSuccess = FALSE;
+    if (apiPort > 0) {
+        if (ReloadSingBoxConfig(L"config.json")) {
+            apiSuccess = TRUE;
+            wsprintfW(message, L"节点已切换: %s\n(API 热重载成功)", tag);
+        }
+    }
+
+    // 4. 根据 API 结果决定是否重启进程
+    if (apiSuccess) {
+        ShowTrayTip(L"切换成功", message);
+    } else {
+        // API 失败或未配置 API，回退到重启进程的方式
+        g_isExiting = TRUE;
+        StopSingBox();
+        g_isExiting = FALSE;
+        StartSingBox();
+        
+        wsprintfW(message, L"当前节点: %s", tag);
+        ShowTrayTip(L"切换成功", message);
+    }
 }
 
 void SetSystemProxy(BOOL enable) {
@@ -675,7 +806,6 @@ void SetSystemProxy(BOOL enable) {
     InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
     InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
-
 BOOL IsSystemProxyEnabled() {
     HKEY hKey;
     DWORD dwEnable = 0;
@@ -868,7 +998,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t* pMessage = (wchar_t*)lParam;
         if (pTitle && pMessage) {
             ShowTrayTip(pTitle, pMessage);
-            // 这里处理了 PostTrayTip 发送过来的内存
             free(pTitle);
             free(pMessage);
         }
@@ -935,11 +1064,21 @@ BOOL IsAutorunEnabled() {
 }
 
 void CreateDefaultConfig() {
+    // [更新] 添加 experimental 字段以支持 API 热重载
     const char* defaultConfig =
         "{\n"
         "\t\"log\": {\n"
         "\t\t\"disabled\": false,\n"
         "\t\t\"level\": \"debug\"\n"
+        "\t},\n"
+        "\t\"experimental\": {\n"
+        "\t\t\"clash_api\": {\n"
+        "\t\t\t\"external_controller\": \"127.0.0.1:9090\",\n"
+        "\t\t\t\"external_ui\": \"ui\",\n"
+        "\t\t\t\"secret\": \"\",\n"
+        "\t\t\t\"external_ui_download_url\": \"\",\n"
+        "\t\t\t\"external_ui_download_detour\": \"\"\n"
+        "\t\t}\n"
         "\t},\n"
         "\t\"dns\": {\n"
         "\t\t\"servers\": [\n"
@@ -1090,9 +1229,7 @@ BOOL MoveFileCrossVolumeW(const wchar_t* lpExistingFileName, const wchar_t* lpNe
     return FALSE;
 }
 
-// [重构] 修复了内存泄漏隐患的 PostTrayTip
 void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message) {
-    // 关键修复：程序退出或窗口无效时，不再分配内存
     if (g_isExiting || !IsWindow(hWndMain)) {
         return;
     }
@@ -1111,7 +1248,6 @@ void PostTrayTip(HWND hWndMain, const wchar_t* title, const wchar_t* message) {
     wcsncpy(pMessage, message, msgLen);
     pMessage[msgLen - 1] = L'\0';
     
-    // 关键修复：尝试发送消息，若失败则手动释放内存
     if (!PostMessageW(hWndMain, WM_SHOW_TRAY_TIP, (WPARAM)pTitle, (LPARAM)pMessage)) {
         free(pTitle);
         free(pMessage);
@@ -1398,11 +1534,22 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                         RefreshNodeListBox(hListBox);
 
                         if (wasCurrentNode) {
-                            MessageBoxW(hWnd, L"检测到当前活动节点已被修改，核心将自动重启以应用更改。", L"提示", MB_OK | MB_ICONINFORMATION);
-                            g_isExiting = TRUE;
-                            StopSingBox();
-                            g_isExiting = FALSE;
-                            StartSingBox();
+                            // [重构] 尝试热重载
+                            BOOL reloaded = FALSE;
+                            if (apiPort > 0) {
+                                 if (ReloadSingBoxConfig(L"config.json")) {
+                                     reloaded = TRUE;
+                                     MessageBoxW(hWnd, L"当前节点已修改，核心已通过 API 热重载配置。", L"提示", MB_OK | MB_ICONINFORMATION);
+                                 }
+                            }
+                            
+                            if (!reloaded) {
+                                MessageBoxW(hWnd, L"检测到当前活动节点已被修改，核心将自动重启以应用更改。", L"提示", MB_OK | MB_ICONINFORMATION);
+                                g_isExiting = TRUE;
+                                StopSingBox();
+                                g_isExiting = FALSE;
+                                StartSingBox();
+                            }
                         }
                     }
                     EnableWindow(hWnd, TRUE);
@@ -1463,7 +1610,7 @@ LRESULT CALLBACK NodeManagerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     return 0;
 }
-// [重构] 修复了 GDI 句柄泄漏的 ModifyNodeWndProc
+
 LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit, hOkBtn, hCancelBtn, hFormatBtn, hLabel;
 
@@ -1484,7 +1631,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             SendMessage(hOkBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hCancelBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
-            // [修复] 创建字体并保存句柄到窗口属性，防止泄漏
             HFONT hJsonFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
             if(hJsonFont) {
                 SendMessage(hEdit, WM_SETFONT, (WPARAM)hJsonFont, TRUE);
@@ -1630,7 +1776,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             break;
         }
         case WM_DESTROY: {
-             // [修复] 从属性中获取并删除字体对象
              HANDLE hFont = GetPropW(hWnd, L"JsonFont");
              if (hFont) {
                  DeleteObject((HFONT)hFont);
@@ -1644,7 +1789,6 @@ LRESULT CALLBACK ModifyNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
     return 0;
 }
 
-// [重构] 修复了 GDI 句柄泄漏的 AddNodeWndProc
 LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit, hOkBtn, hCancelBtn, hFormatBtn, hLabel;
 
@@ -1660,7 +1804,6 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessage(hOkBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessage(hCancelBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             
-            // [修复] 创建字体并保存句柄
             HFONT hJsonFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
             if(hJsonFont) {
                 SendMessage(hEdit, WM_SETFONT, (WPARAM)hJsonFont, TRUE);
@@ -1776,7 +1919,6 @@ LRESULT CALLBACK AddNodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hWnd);
             break;
         case WM_DESTROY: {
-             // [修复] 从属性中获取并删除字体对象
              HANDLE hFont = GetPropW(hWnd, L"JsonFont");
              if (hFont) {
                  DeleteObject((HFONT)hFont);
@@ -2381,7 +2523,6 @@ LRESULT CALLBACK LogViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
                 }
                 SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
                 SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)pLogChunk);
-                // [注意] 此处释放是必须的，配合Part 1的修改，只有窗口存在时才会收到此消息，因此是安全的
                 free(pLogChunk);
             }
             break;
