@@ -50,7 +50,7 @@
 	"outbounds":	[{
 			"tag":	"🎈 自动选择",
 			"type":	"selector",
-			"outbounds":	["⚡️ 自动测速", "新加坡VLESS", "新加坡trojan", "🎯 全球直连"]
+			"outbounds":	["⚡️ 自动测速", "🎯 全球直连"]
 		}, {
 			"tag":	"⚡️ 自动测速",
 			"type":	"urltest",
@@ -67,49 +67,6 @@
 		}, {
 			"tag":	"dns-out",
 			"type":	"dns"
-		}, {
-			"type":	"vless",
-			"tag":	"新加坡VLESS",
-			"server":	"www.visa.com.tw",
-			"server_port":	443,
-			"uuid":	"0ae3428c-7c30-458d-92e4-146baedd06bd",
-			"flow":	"",
-			"tls":	{
-				"enabled":	true,
-				"server_name":	"zoo.cbu.net",
-				"utls":	{
-					"enabled":	true,
-					"fingerprint":	"chrome"
-				}
-			},
-			"transport":	{
-				"type":	"ws",
-				"path":	"/谁看谁SB",
-				"headers":	{
-					"Host":	"zoo.cbu.net"
-				}
-			}
-		}, {
-			"type":	"trojan",
-			"tag":	"新加坡trojan",
-			"server":	"www.visa.com.tw",
-			"server_port":	443,
-			"password":	"132579",
-			"tls":	{
-				"enabled":	true,
-				"server_name":	"zoo.cbu.net",
-				"utls":	{
-					"enabled":	true,
-					"fingerprint":	"chrome"
-				}
-			},
-			"transport":	{
-				"type":	"ws",
-				"path":	"/谁看谁SB",
-				"headers":	{
-					"Host":	"zoo.cbu.net"
-				}
-			}
 		}],
 	"route":	{
 		"rule_set":	[{
@@ -153,7 +110,7 @@
 		},
 		"clash_api":	{
 			"external_controller":	"",
-			"external_ui":	"ui",
+			"external_ui":	"",
 			"external_ui_download_url":	"",
 			"external_ui_download_detour":	"🎈 自动选择",
 			"secret":	"",
