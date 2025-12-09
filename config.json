@@ -1,0 +1,163 @@
+{
+	"log":	{
+		"disabled":	false,
+		"level":	"info",
+		"timestamp":	true
+	},
+	"dns":	{
+		"servers":	[{
+				"tag":	"dns-direct",
+				"address":	"https://doh.pub/dns-query",
+				"address_resolver":	"dns-local",
+				"detour":	"🎯 全球直连"
+			}, {
+				"tag":	"dns-local",
+				"address":	"223.5.5.5",
+				"detour":	"🎯 全球直连"
+			}, {
+				"tag":	"dns-proxy",
+				"address":	"https://cloudflare-dns.com/dns-query",
+				"address_resolver":	"dns-local",
+				"detour":	"🎈 自动选择"
+			}, {
+				"tag":	"dns-block",
+				"address":	"rcode://refused"
+			}],
+		"rules":	[{
+				"outbound":	"any",
+				"server":	"dns-local"
+			}, {
+				"clash_mode":	"direct",
+				"server":	"dns-direct"
+			}, {
+				"clash_mode":	"global",
+				"server":	"dns-proxy"
+			}, {
+				"rule_set":	"geosite-cn",
+				"server":	"dns-direct"
+			}],
+		"final":	"dns-proxy",
+		"strategy":	"ipv4_only"
+	},
+	"inbounds":	[{
+			"tag":	"mixed-in",
+			"type":	"mixed",
+			"listen":	"127.0.0.1",
+			"listen_port":	10809,
+			"sniff":	true,
+			"sniff_override_destination":	true
+		}],
+	"outbounds":	[{
+			"tag":	"🎈 自动选择",
+			"type":	"selector",
+			"outbounds":	["⚡️ 自动测速", "新加坡VLESS", "新加坡trojan", "🎯 全球直连"]
+		}, {
+			"tag":	"⚡️ 自动测速",
+			"type":	"urltest",
+			"outbounds":	["新加坡VLESS", "新加坡trojan"],
+			"url":	"http://www.gstatic.com/generate_204",
+			"interval":	"1m",
+			"tolerance":	120
+		}, {
+			"tag":	"🎯 全球直连",
+			"type":	"direct"
+		}, {
+			"tag":	"🚫 断开连接",
+			"type":	"block"
+		}, {
+			"tag":	"dns-out",
+			"type":	"dns"
+		}, {
+			"type":	"vless",
+			"tag":	"新加坡VLESS",
+			"server":	"www.visa.com.tw",
+			"server_port":	443,
+			"uuid":	"0ae3428c-7c30-458d-92e4-146baedd06bd",
+			"flow":	"",
+			"tls":	{
+				"enabled":	true,
+				"server_name":	"zoo.cbu.net",
+				"utls":	{
+					"enabled":	true,
+					"fingerprint":	"chrome"
+				}
+			},
+			"transport":	{
+				"type":	"ws",
+				"path":	"/谁看谁SB",
+				"headers":	{
+					"Host":	"zoo.cbu.net"
+				}
+			}
+		}, {
+			"type":	"trojan",
+			"tag":	"新加坡trojan",
+			"server":	"www.visa.com.tw",
+			"server_port":	443,
+			"password":	"132579",
+			"tls":	{
+				"enabled":	true,
+				"server_name":	"zoo.cbu.net",
+				"utls":	{
+					"enabled":	true,
+					"fingerprint":	"chrome"
+				}
+			},
+			"transport":	{
+				"type":	"ws",
+				"path":	"/谁看谁SB",
+				"headers":	{
+					"Host":	"zoo.cbu.net"
+				}
+			}
+		}],
+	"route":	{
+		"rule_set":	[{
+				"tag":	"geosite-cn",
+				"type":	"local",
+				"format":	"binary",
+				"path":	"geosite-cn.srs"
+			}, {
+				"tag":	"geoip-cn",
+				"type":	"local",
+				"format":	"binary",
+				"path":	"geoip-cn.srs"
+			}],
+		"rules":	[{
+				"protocol":	"dns",
+				"outbound":	"dns-out"
+			}, {
+				"clash_mode":	"direct",
+				"outbound":	"🎯 全球直连"
+			}, {
+				"clash_mode":	"global",
+				"outbound":	"🎈 自动选择"
+			}, {
+				"ip_cidr":	["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"],
+				"outbound":	"🎯 全球直连"
+			}, {
+				"rule_set":	"geosite-cn",
+				"outbound":	"🎯 全球直连"
+			}, {
+				"rule_set":	"geoip-cn",
+				"outbound":	"🎯 全球直连"
+			}],
+		"final":	"🎈 自动选择",
+		"auto_detect_interface":	true,
+		"find_process":	true
+	},
+	"experimental":	{
+		"cache_file":	{
+			"enabled":	true,
+			"store_fakeip":	true
+		},
+		"clash_api":	{
+			"external_controller":	"",
+			"external_ui":	"ui",
+			"external_ui_download_url":	"",
+			"external_ui_download_detour":	"🎈 自动选择",
+			"secret":	"",
+			"default_mode":	"rule"
+		}
+	}
+}
